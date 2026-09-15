@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -89,7 +90,7 @@ func (s *Snapshotter) Load() error {
 	data, err := s.rdb.Get(context.Background(), s.key).Bytes()
 	if err != nil {
 		if err == redis.Nil {
-			fmt.Println("⚠️ 无快照，从 MySQL 全量重建订单簿")
+			slog.Info("no snapshot, rebuilding from MySQL")
 			return s.rebuildFromDB()
 		}
 		return err
@@ -103,14 +104,13 @@ func (s *Snapshotter) Load() error {
 	s.ob.mu.Lock()
 	s.ob.bids = s.restoreOrderBook(snapshot.Bids, Buy)
 	s.ob.asks = s.restoreOrderBook(snapshot.Asks, Sell)
-	// ✅ 重建跳表
 	s.rebuildSkipList()
 	s.ob.mu.Unlock()
 
-	fmt.Printf("✅ 快照恢复完成（时间戳: %d）\n", snapshot.Timestamp)
+	slog.Info("snapshot restored", "timestamp", snapshot.Timestamp)
 
 	if err := s.ReplayWAL(); err != nil {
-		fmt.Printf("⚠️ WAL 回放失败: %v\n", err)
+		slog.Warn("WAL replay failed", "error", err)
 	}
 
 	return s.Reconcile()
@@ -133,7 +133,7 @@ func (s *Snapshotter) ReplayWAL() error {
 	}
 
 	if len(entries) == 0 {
-		fmt.Println("📋 WAL 为空，无需回放")
+		slog.Info("WAL is empty, no replay needed")
 		return nil
 	}
 
@@ -173,7 +173,7 @@ func (s *Snapshotter) ReplayWAL() error {
 
 	if replayedCount > 0 {
 		s.rebuildSkipList()
-		fmt.Printf("✅ WAL 回放完成：%d 条操作\n", replayedCount)
+		slog.Info("WAL replay completed", "count", replayedCount)
 	}
 
 	return nil
@@ -192,7 +192,7 @@ func (s *Snapshotter) rebuildFromDB() error {
 		Side      string
 		Price     int64
 		Remaining int64
-		CreatedAt int64
+		CreatedAt time.Time
 	}
 
 	query := `SELECT order_id, user_id, side, price, remaining, created_at 
@@ -224,13 +224,13 @@ func (s *Snapshotter) rebuildFromDB() error {
 			Price:     o.Price,
 			Amount:    o.Remaining,
 			Remaining: o.Remaining,
-			Timestamp: o.CreatedAt,
+			Timestamp: o.CreatedAt.UnixMilli(),
 		}
 		s.addOrderLocked(order)
 	}
 
 	s.rebuildSkipList()
-	fmt.Printf("✅ 从 MySQL 重建订单簿完成，共 %d 条挂单\n", len(orders))
+	slog.Info("orderbook rebuilt from MySQL", "count", len(orders))
 	return nil
 }
 
@@ -242,7 +242,7 @@ func (s *Snapshotter) Reconcile() error {
 		Side      string
 		Price     int64
 		Remaining int64
-		CreatedAt int64
+		CreatedAt time.Time
 	}
 
 	query := `SELECT order_id, user_id, side, price, remaining, created_at 
@@ -290,7 +290,7 @@ func (s *Snapshotter) Reconcile() error {
 				Price:     o.Price,
 				Amount:    o.Remaining,
 				Remaining: o.Remaining,
-				Timestamp: o.CreatedAt,
+				Timestamp: o.CreatedAt.UnixMilli(),
 			}
 			s.addOrderLocked(order)
 			addedCount++
@@ -306,16 +306,15 @@ func (s *Snapshotter) Reconcile() error {
 
 	if addedCount > 0 || removedCount > 0 {
 		s.rebuildSkipList()
-		fmt.Printf("✅ 对账完成：补入 %d 条，移除 %d 条\n", addedCount, removedCount)
+		slog.Info("reconcile completed", "added", addedCount, "removed", removedCount)
 	} else {
-		fmt.Println("✅ 对账完成：无差异")
+		slog.Info("reconcile completed, no difference")
 	}
 
 	return nil
 }
 
 // addOrderLocked 内部使用，不加锁
-// ✅ 同步维护跳表
 func (s *Snapshotter) addOrderLocked(order *Order) {
 	var list *OrderList
 	if order.Side == Buy {
@@ -323,14 +322,14 @@ func (s *Snapshotter) addOrderLocked(order *Order) {
 		if list == nil {
 			list = &OrderList{}
 			s.ob.bids[order.Price] = list
-			s.ob.bidPrices.Insert(order.Price, list) // ✅ 跳表
+			s.ob.bidPrices.Insert(order.Price, list)
 		}
 	} else {
 		list = s.ob.asks[order.Price]
 		if list == nil {
 			list = &OrderList{}
 			s.ob.asks[order.Price] = list
-			s.ob.askPrices.Insert(order.Price, list) // ✅ 跳表
+			s.ob.askPrices.Insert(order.Price, list)
 		}
 	}
 
@@ -344,7 +343,6 @@ func (s *Snapshotter) addOrderLocked(order *Order) {
 }
 
 // removeOrderLocked 内部使用，不加锁
-// ✅ 同步维护跳表
 func (s *Snapshotter) removeOrderLocked(orderID string) {
 	for price, list := range s.ob.bids {
 		if list == nil || list.Head == nil {
@@ -353,7 +351,7 @@ func (s *Snapshotter) removeOrderLocked(orderID string) {
 		if removed := s.removeFromList(list, orderID); removed != nil {
 			if list.Head == nil {
 				delete(s.ob.bids, price)
-				s.ob.bidPrices.Remove(price) // ✅ 跳表
+				s.ob.bidPrices.Remove(price)
 			}
 			return
 		}
@@ -365,7 +363,7 @@ func (s *Snapshotter) removeOrderLocked(orderID string) {
 		if removed := s.removeFromList(list, orderID); removed != nil {
 			if list.Head == nil {
 				delete(s.ob.asks, price)
-				s.ob.askPrices.Remove(price) // ✅ 跳表
+				s.ob.askPrices.Remove(price)
 			}
 			return
 		}
@@ -406,7 +404,7 @@ func (s *Snapshotter) removeFromList(list *OrderList, orderID string) *Order {
 	return nil
 }
 
-// ✅ 新增：重建跳表（替代原来的 rebuildBestPriceCache）
+// rebuildSkipList 重建跳表
 func (s *Snapshotter) rebuildSkipList() {
 	s.ob.bidPrices = NewSkipList(false)
 	s.ob.askPrices = NewSkipList(true)
@@ -433,9 +431,9 @@ func (s *Snapshotter) StartAutoSave() {
 			select {
 			case <-ticker.C:
 				if err := s.Save(); err != nil {
-					fmt.Printf("⚠️ 快照保存失败: %v\n", err)
+					slog.Warn("snapshot save failed", "error", err)
 				} else {
-					fmt.Println("✅ 快照已保存到 Redis")
+					slog.Debug("snapshot saved", "key", s.key)
 				}
 			case <-s.stop:
 				return

@@ -1,9 +1,9 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 
 	"cex-backend/internal/api/handler"
 	"cex-backend/internal/api/service"
@@ -16,11 +16,18 @@ import (
 )
 
 func main() {
+	// ✅ 初始化 slog（JSON 格式，INFO 级别）
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	// 1. 连接 MySQL
 	dsn := "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
 	db, err := persistence.InitDB(dsn)
 	if err != nil {
-		log.Fatal("❌ MySQL 连接失败:", err)
+		slog.Error("MySQL 连接失败", "error", err)
+		os.Exit(1)
 	}
 	repo := persistence.NewTradeRepo(db)
 	balanceRepo := persistence.NewBalanceRepo(db)
@@ -40,7 +47,7 @@ func main() {
 
 		// ✅ 启动时恢复：快照 → WAL → MySQL 对账
 		if err := snapshotter.Load(); err != nil {
-			log.Printf("⚠️ %s 订单簿恢复失败: %v", symbol, err)
+			slog.Warn("订单簿恢复失败", "symbol", symbol, "error", err)
 		}
 
 		// ✅ 启动定时快照（每 5 秒）
@@ -56,7 +63,6 @@ func main() {
 	}
 
 	// 6. 初始化 Service 和 Handler
-	// ✅ 传入 balanceRepo
 	orderService := service.NewOrderService(eng, repo, ledgerRepo, hub, balanceRepo)
 	orderHandler := handler.NewOrderHandler(orderService)
 	balanceHandler := handler.NewBalanceHandler(balanceRepo)
@@ -64,7 +70,10 @@ func main() {
 	ledgerHandler := handler.NewLedgerHandler(ledgerRepo)
 
 	// 7. 设置 Gin 路由
-	r := gin.Default()
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()         // ✅ 不用 Default()，避免 Gin 默认日志
+	r.Use(gin.Recovery())  // ✅ 保留 panic 恢复
+	r.Use(RequestLogger()) // ✅ 用 slog 记录请求
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
@@ -80,7 +89,7 @@ func main() {
 
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Println("WebSocket upgrade error:", err)
+			slog.Error("WebSocket upgrade error", "error", err)
 			return
 		}
 
@@ -118,6 +127,21 @@ func main() {
 		api.GET("/ledger/:user_id", ledgerHandler.GetLedgerByUser)
 	}
 
-	fmt.Println("🚀 CEX API 启动在 http://localhost:8080")
+	slog.Info("CEX API 启动", "addr", "http://localhost:8080")
 	r.Run(":8080")
+}
+
+// ✅ RequestLogger 用 slog 记录 HTTP 请求
+func RequestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+
+		slog.Info("request",
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"latency_ms", c.Writer.Size(),
+			"client_ip", c.ClientIP(),
+		)
+	}
 }
