@@ -20,14 +20,12 @@ echo -e "\n${YELLOW}📦 1. 重置测试数据...${NC}"
 mysql -u root -e "USE cex; TRUNCATE TABLE orders; TRUNCATE TABLE trades; TRUNCATE TABLE balances; TRUNCATE TABLE ledgers;" 2>/dev/null
 redis-cli FLUSHALL > /dev/null
 
-# 2. 启动服务（后台）
+# 2. 启动服务（相对路径）
+cd "$(dirname "$0")/.."
 echo -e "\n${YELLOW}🚀 2. 启动服务...${NC}"
-cd /Users/chantrumps/cex-backend  # 替换成你的实际路径
 go run cmd/api/main.go > /tmp/cex_service.log 2>&1 &
 SERVICE_PID=$!
 echo "服务 PID: $SERVICE_PID"
-
-# 等待服务启动
 sleep 5
 
 # 3. 充值
@@ -49,44 +47,52 @@ ORDER_RESP=$(curl -s -X POST $BASE_URL/orders \
 ORDER_ID=$(echo $ORDER_RESP | jq -r '.order_id')
 echo "订单 ID: $ORDER_ID"
 
+sleep 1
+
 # 部分成交（买 3 BTC）
 curl -s -X POST $BASE_URL/orders \
   -H "Content-Type: application/json" \
   -d '{"user_id":"crash_test_A","symbol":"BTC/USDT","side":"BUY","order_type":"MARKET","amount":3}' > /dev/null
 
-# 记录崩溃前的状态
+sleep 1
+
+# 5. 记录崩溃前的状态
 echo -e "\n${YELLOW}📊 5. 崩溃前的状态...${NC}"
 BAL_BEFORE=$(curl -s $BASE_URL/balance/crash_test_B/BTC | jq -r '.available')
 FROZEN_BEFORE=$(curl -s $BASE_URL/balance/crash_test_B/BTC | jq -r '.frozen')
-ORDER_BEFORE=$(curl -s $BASE_URL/orders/$ORDER_ID | jq -r '.status')
+ORDER_BEFORE=$(curl -s $BASE_URL/orders/$ORDER_ID | jq -r '.Status')
 
 echo "test_B BTC available: $BAL_BEFORE"
 echo "test_B BTC frozen:    $FROZEN_BEFORE"
 echo "订单状态:              $ORDER_BEFORE"
 
-# 5. kill -9 服务
+# 6. kill -9 服务
 echo -e "\n${RED}💀 6. kill -9 杀掉服务...${NC}"
-kill -9 $SERVICE_PID
+kill -9 $SERVICE_PID 2>/dev/null
 sleep 2
 
-# 6. 重启服务
+# 7. 重启服务
 echo -e "\n${YELLOW}🔄 7. 重启服务...${NC}"
 go run cmd/api/main.go > /tmp/cex_service_restart.log 2>&1 &
 NEW_PID=$!
 echo "新服务 PID: $NEW_PID"
 sleep 5
 
-# 7. 验证恢复后的状态
+# ✅ 打印恢复日志
+echo -e "\n${YELLOW}📋 服务恢复日志...${NC}"
+grep -E "快照|WAL|对账|恢复" /tmp/cex_service_restart.log
+
+# 8. 验证恢复后的状态
 echo -e "\n${YELLOW}📊 8. 崩溃恢复后的状态...${NC}"
 BAL_AFTER=$(curl -s $BASE_URL/balance/crash_test_B/BTC | jq -r '.available')
 FROZEN_AFTER=$(curl -s $BASE_URL/balance/crash_test_B/BTC | jq -r '.frozen')
-ORDER_AFTER=$(curl -s $BASE_URL/orders/$ORDER_ID | jq -r '.status')
+ORDER_AFTER=$(curl -s $BASE_URL/orders/$ORDER_ID | jq -r '.Status')
 
 echo "test_B BTC available: $BAL_AFTER"
 echo "test_B BTC frozen:    $FROZEN_AFTER"
 echo "订单状态:              $ORDER_AFTER"
 
-# 8. 对比结果
+# 9. 对比结果
 echo -e "\n${YELLOW}========================================${NC}"
 echo -e "${YELLOW}   崩溃恢复对比${NC}"
 echo -e "${YELLOW}========================================${NC}"
@@ -122,5 +128,4 @@ echo -e "\n${GREEN}========================================${NC}"
 echo -e "${GREEN}   测试完成：$PASS PASS / $FAIL FAIL${NC}"
 echo -e "${GREEN}========================================${NC}"
 
-# 清理
 kill -9 $NEW_PID 2>/dev/null

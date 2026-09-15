@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -145,7 +146,15 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 
 	ob := s.eng.GetOrderBook(req.Symbol)
 	trades := ob.Match(order)
-	fmt.Printf("🔍 撮合结果: %d 笔成交，订单剩余: %d\n", len(trades), order.Remaining)
+
+	// ✅ slog 结构化日志
+	slog.Info("match completed",
+		"order_id", order.ID,
+		"user_id", order.UserID,
+		"symbol", req.Symbol,
+		"trades", len(trades),
+		"remaining", order.Remaining,
+	)
 
 	var tradeResponses []TradeResponse
 	for _, trade := range trades {
@@ -301,7 +310,14 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	}
 
 	if err := s.balanceRepo.UnfreezeBalance(userID, unfreezeAsset, unfreezeAmount); err != nil {
-		fmt.Printf("⚠️ 解冻失败: %v\n", err)
+		// ✅ slog 结构化日志
+		slog.Warn("unfreeze failed",
+			"order_id", orderID,
+			"user_id", userID,
+			"asset", unfreezeAsset,
+			"amount", unfreezeAmount,
+			"error", err,
+		)
 	}
 
 	_ = s.ledger.Record(

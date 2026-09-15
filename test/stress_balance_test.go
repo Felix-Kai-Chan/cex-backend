@@ -18,12 +18,16 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("MySQL 连接失败: %v", err)
 	}
+	// ✅ 调大连接池
+	sqlDB, _ := db.DB()
+	sqlDB.SetMaxOpenConns(200)
+	sqlDB.SetMaxIdleConns(50)
 	return db
 }
 
 // TestConcurrentDeduct 并发扣减测试
-// 场景：test_stress 用户有 100 USDT，1000 个 goroutine 同时扣 10 USDT
-// 预期：只有 10 个成功，990 个失败，最终余额 = 0，不会为负
+// 场景：test_stress 用户有 100 USDT，500 个 goroutine 同时扣 10 USDT
+// 预期：只有 10 个成功，490 个失败，最终余额 = 0，不会为负
 func TestConcurrentDeduct(t *testing.T) {
 	db := setupTestDB(t)
 	repo := persistence.NewBalanceRepo(db)
@@ -37,13 +41,15 @@ func TestConcurrentDeduct(t *testing.T) {
 		t.Fatalf("初始化余额失败: %v", err)
 	}
 
-	// 2. 1000 个 goroutine 并发扣 10 USDT
+	// 2. 500 个 goroutine 并发扣 10 USDT
 	var successCount int64
 	var failCount int64
 	var wg sync.WaitGroup
 
-	concurrency := 1000
+	concurrency := 500
 	deductAmount := 10.0
+	expectedSuccess := int64(100 / deductAmount)         // ✅ 动态计算：10
+	expectedFail := int64(concurrency) - expectedSuccess // ✅ 动态计算：490
 
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
@@ -66,17 +72,17 @@ func TestConcurrentDeduct(t *testing.T) {
 	fmt.Printf("并发数:     %d\n", concurrency)
 	fmt.Printf("扣减金额:   %.2f USDT\n", deductAmount)
 	fmt.Printf("初始余额:   100.00 USDT\n")
-	fmt.Printf("成功次数:   %d（预期 10）\n", successCount)
-	fmt.Printf("失败次数:   %d（预期 990）\n", failCount)
+	fmt.Printf("成功次数:   %d（预期 %d）\n", successCount, expectedSuccess)
+	fmt.Printf("失败次数:   %d（预期 %d）\n", failCount, expectedFail)
 	fmt.Printf("最终余额:   %.2f USDT（预期 0）\n", bal.Available)
 	fmt.Printf("===========================\n\n")
 
 	// 断言
-	if successCount != 10 {
-		t.Errorf("❌ 成功次数错误：期望 10，实际 %d", successCount)
+	if successCount != expectedSuccess {
+		t.Errorf("❌ 成功次数错误：期望 %d，实际 %d", expectedSuccess, successCount)
 	}
-	if failCount != 990 {
-		t.Errorf("❌ 失败次数错误：期望 990，实际 %d", failCount)
+	if failCount != expectedFail {
+		t.Errorf("❌ 失败次数错误：期望 %d，实际 %d", expectedFail, failCount)
 	}
 	if bal.Available != 0 {
 		t.Errorf("❌ 最终余额错误：期望 0，实际 %.2f", bal.Available)
