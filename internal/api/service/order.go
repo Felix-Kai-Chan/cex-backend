@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"cex-backend/internal/engine"
@@ -9,33 +10,55 @@ import (
 	"cex-backend/internal/websocket"
 )
 
-type OrderService struct {
-	eng    *engine.Engine
-	repo   *persistence.TradeRepo
-	ledger *persistence.LedgerRepo
-	hub    *websocket.Hub
+func getBaseAsset(symbol string) string {
+	parts := strings.Split(symbol, "/")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return symbol
 }
 
-func NewOrderService(eng *engine.Engine, repo *persistence.TradeRepo, ledger *persistence.LedgerRepo, hub *websocket.Hub) *OrderService {
+func getQuoteAsset(symbol string) string {
+	parts := strings.Split(symbol, "/")
+	if len(parts) > 1 {
+		return parts[1]
+	}
+	return "USDT"
+}
+
+type OrderService struct {
+	eng         *engine.Engine
+	repo        *persistence.TradeRepo
+	ledger      *persistence.LedgerRepo
+	hub         *websocket.Hub
+	balanceRepo *persistence.BalanceRepo
+}
+
+func NewOrderService(
+	eng *engine.Engine,
+	repo *persistence.TradeRepo,
+	ledger *persistence.LedgerRepo,
+	hub *websocket.Hub,
+	balanceRepo *persistence.BalanceRepo,
+) *OrderService {
 	return &OrderService{
-		eng:    eng,
-		repo:   repo,
-		ledger: ledger,
-		hub:    hub,
+		eng:         eng,
+		repo:        repo,
+		ledger:      ledger,
+		hub:         hub,
+		balanceRepo: balanceRepo,
 	}
 }
 
-// CreateOrderRequest 下单请求
 type CreateOrderRequest struct {
 	UserID    string `json:"user_id"`
-	Symbol    string `json:"symbol"`     // BTC/USDT, ETH/USDT 等
-	Side      string `json:"side"`       // BUY / SELL
-	OrderType string `json:"order_type"` // LIMIT / MARKET
-	Price     int64  `json:"price"`      // 限价单必填，市价单忽略
+	Symbol    string `json:"symbol"`
+	Side      string `json:"side"`
+	OrderType string `json:"order_type"`
+	Price     int64  `json:"price"`
 	Amount    int64  `json:"amount"`
 }
 
-// CreateOrderResponse 下单响应
 type CreateOrderResponse struct {
 	OrderID string          `json:"order_id"`
 	Status  string          `json:"status"`
@@ -43,15 +66,12 @@ type CreateOrderResponse struct {
 	Trades  []TradeResponse `json:"trades,omitempty"`
 }
 
-// TradeResponse 成交响应
 type TradeResponse struct {
 	Price    int64 `json:"price"`
 	Quantity int64 `json:"quantity"`
 }
 
-// CreateOrder 下单
 func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderResponse, error) {
-	// 1. 校验订单
 	if req.UserID == "" {
 		return nil, fmt.Errorf("user_id 不能为空")
 	}
@@ -68,13 +88,11 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("amount 必须大于 0")
 	}
 
-	// 2. 确定买卖方向
 	side := engine.Buy
 	if req.Side == "SELL" {
 		side = engine.Sell
 	}
 
-	// 3. 市价单 price = 0，限价单用传入的价格
 	var price int64
 	if req.OrderType == "MARKET" {
 		price = 0
@@ -82,7 +100,37 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		price = req.Price
 	}
 
-	// 4. 构造订单
+	baseAsset := getBaseAsset(req.Symbol)
+	quoteAsset := getQuoteAsset(req.Symbol)
+
+	// 冻结
+	var freezeAmount float64
+	var freezeAsset string
+
+	if side == engine.Buy {
+		freezeAsset = quoteAsset
+		if req.OrderType == "MARKET" {
+			ob := s.eng.GetOrderBook(req.Symbol)
+			bestPrice := ob.BestAsk()
+			if bestPrice == 0 {
+				bestPrice = ob.BestBid()
+			}
+			if bestPrice == 0 {
+				return nil, fmt.Errorf("订单簿为空，无法估算市价单冻结金额")
+			}
+			freezeAmount = float64(bestPrice * req.Amount)
+		} else {
+			freezeAmount = float64(price * req.Amount)
+		}
+	} else {
+		freezeAsset = baseAsset
+		freezeAmount = float64(req.Amount)
+	}
+
+	if err := s.balanceRepo.FreezeBalance(req.UserID, freezeAsset, freezeAmount); err != nil {
+		return nil, fmt.Errorf("冻结余额失败: %w", err)
+	}
+
 	order := &engine.Order{
 		ID:        fmt.Sprintf("%s_%d", req.UserID, time.Now().UnixNano()),
 		UserID:    req.UserID,
@@ -93,17 +141,12 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		Timestamp: time.Now().UnixMilli(),
 	}
 
-	// 5. 保存订单到数据库（初始状态 PENDING）
 	_ = s.repo.SaveOrder(order.ID, order.UserID, req.Side, order.Price, order.Amount, order.Remaining, "PENDING")
 
-	// 6. 获取该交易对的订单簿
 	ob := s.eng.GetOrderBook(req.Symbol)
-
-	// 7. 执行撮合
 	trades := ob.Match(order)
 	fmt.Printf("🔍 撮合结果: %d 笔成交，订单剩余: %d\n", len(trades), order.Remaining)
 
-	// 8. 处理成交结果
 	var tradeResponses []TradeResponse
 	for _, trade := range trades {
 		tradeResponses = append(tradeResponses, TradeResponse{
@@ -120,25 +163,58 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			trade.Timestamp,
 		)
 
-		_ = s.repo.UpdateOrder(trade.BuyOrder, 0, "FILLED")
-		_ = s.repo.UpdateOrder(trade.SellOrder, 0, "FILLED")
+		// ✅ 余额操作
+		tradeAmount := float64(trade.Price * trade.Quantity) // USDT
+		tradeQty := float64(trade.Quantity)                  // BTC
 
-		// ✅ 记录资金流水（成交扣款）
-		// 注意：这里需要获取用户余额，简化处理
+		// 买方：扣 USDT，加 BTC
+		_ = s.balanceRepo.DeductFrozen(trade.BuyUserID, quoteAsset, tradeAmount)
+		_ = s.balanceRepo.AddBalance(trade.BuyUserID, baseAsset, tradeQty)
+
+		// 卖方：扣 BTC，加 USDT
+		_ = s.balanceRepo.DeductFrozen(trade.SellUserID, baseAsset, tradeQty)
+		_ = s.balanceRepo.AddBalance(trade.SellUserID, quoteAsset, tradeAmount)
+
+		// ✅ 更新买方订单状态
+		var buyerOrder persistence.OrderModel
+		if err := s.repo.GetOrderByID(trade.BuyOrder, &buyerOrder); err == nil {
+			newRemaining := buyerOrder.Remaining - trade.Quantity
+			status := "PENDING"
+			if newRemaining == 0 {
+				status = "FILLED"
+			} else if newRemaining < buyerOrder.Amount {
+				status = "PARTIAL"
+			}
+			_ = s.repo.UpdateOrder(trade.BuyOrder, newRemaining, status)
+		}
+
+		// ✅ 更新卖方订单状态
+		var sellerOrder persistence.OrderModel
+		if err := s.repo.GetOrderByID(trade.SellOrder, &sellerOrder); err == nil {
+			newRemaining := sellerOrder.Remaining - trade.Quantity
+			status := "PENDING"
+			if newRemaining == 0 {
+				status = "FILLED"
+			} else if newRemaining < sellerOrder.Amount {
+				status = "PARTIAL"
+			}
+			_ = s.repo.UpdateOrder(trade.SellOrder, newRemaining, status)
+		}
+
+		// ✅ 双边流水
 		_ = s.ledger.Record(
-			order.UserID,
-			"USDT",
-			-float64(trade.Price*trade.Quantity)/1e8,
-			0, // 余额由 balance_repo 管理，这里只记录流水
-			0,
-			"TRADE",
-			order.ID,
-			trade.TradeID,
-			fmt.Sprintf("成交 %d 数量，价格 %d", trade.Quantity, trade.Price),
+			trade.BuyUserID, quoteAsset, -tradeAmount,
+			0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
+			fmt.Sprintf("买入 %d 数量，价格 %d", trade.Quantity, trade.Price),
+		)
+		_ = s.ledger.Record(
+			trade.SellUserID, quoteAsset, tradeAmount,
+			0, 0, "TRADE", trade.SellOrder, trade.TradeID,
+			fmt.Sprintf("卖出 %d 数量，价格 %d", trade.Quantity, trade.Price),
 		)
 	}
 
-	// 9. 更新当前订单状态
+	// ✅ 更新当前订单状态
 	status := "PENDING"
 	if order.Remaining == 0 {
 		status = "FILLED"
@@ -147,7 +223,20 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}
 	_ = s.repo.UpdateOrder(order.ID, order.Remaining, status)
 
-	// 10. WebSocket 广播成交
+	// ✅ 部分成交：解冻未成交部分的冻结金额
+	if order.Remaining > 0 && order.Remaining < order.Amount {
+		var unfreezeAmount float64
+		var unfreezeAsset string
+		if side == engine.Buy {
+			unfreezeAsset = quoteAsset
+			unfreezeAmount = float64(order.Price * order.Remaining)
+		} else {
+			unfreezeAsset = baseAsset
+			unfreezeAmount = float64(order.Remaining)
+		}
+		_ = s.balanceRepo.UnfreezeBalance(order.UserID, unfreezeAsset, unfreezeAmount)
+	}
+
 	if len(tradeResponses) > 0 {
 		s.hub.BroadcastTrade(tradeResponses)
 	}
@@ -160,7 +249,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}, nil
 }
 
-// GetOrder 查询订单
 func (s *OrderService) GetOrder(orderID string) (*persistence.OrderModel, error) {
 	var order persistence.OrderModel
 	err := s.repo.GetOrderByID(orderID, &order)
@@ -170,12 +258,10 @@ func (s *OrderService) GetOrder(orderID string) (*persistence.OrderModel, error)
 	return &order, nil
 }
 
-// GetOrdersByUser 查询用户的所有订单
 func (s *OrderService) GetOrdersByUser(userID string) ([]persistence.OrderModel, error) {
 	return s.repo.GetOrdersByUser(userID)
 }
 
-// CancelOrder 撤销订单
 func (s *OrderService) CancelOrder(orderID, userID string) error {
 	var order persistence.OrderModel
 	if err := s.repo.GetOrderByID(orderID, &order); err != nil {
@@ -194,26 +280,33 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	}
 
 	ob := s.eng.GetOrderBook("BTC/USDT")
-	_, err := ob.CancelOrder(orderID)
-	if err != nil {
-		// 可能已经部分成交，不在簿里了，继续
-	}
+	_, _ = ob.CancelOrder(orderID)
 
 	if err := s.repo.CancelOrder(orderID); err != nil {
 		return err
 	}
 
-	// ✅ 记录资金流水（撤单解冻）
+	baseAsset := getBaseAsset("BTC/USDT")
+	quoteAsset := getQuoteAsset("BTC/USDT")
+
+	var unfreezeAmount float64
+	var unfreezeAsset string
+
+	if order.Side == "BUY" {
+		unfreezeAsset = quoteAsset
+		unfreezeAmount = float64(order.Price * order.Remaining)
+	} else {
+		unfreezeAsset = baseAsset
+		unfreezeAmount = float64(order.Remaining)
+	}
+
+	if err := s.balanceRepo.UnfreezeBalance(userID, unfreezeAsset, unfreezeAmount); err != nil {
+		fmt.Printf("⚠️ 解冻失败: %v\n", err)
+	}
+
 	_ = s.ledger.Record(
-		userID,
-		"USDT",
-		0,
-		0,
-		0,
-		"UNFREEZE",
-		orderID,
-		"",
-		"撤单解冻",
+		userID, unfreezeAsset, 0, 0, 0,
+		"UNFREEZE", orderID, "", "撤单解冻",
 	)
 
 	s.hub.BroadcastOrder(map[string]interface{}{

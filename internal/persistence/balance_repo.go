@@ -51,32 +51,39 @@ func (r *BalanceRepo) GetBalance(userID, asset string) (*BalanceModel, error) {
 // ========== 入账 ==========
 
 // AddBalance 入账（充值/成交后）
+// ✅ 先更新 available，再单独更新 total（避免同一 SQL 里旧值计算问题）
 func (r *BalanceRepo) AddBalance(userID, asset string, amount float64) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		var bal BalanceModel
-		if err := tx.Where("user_id = ? AND asset = ?", userID, asset).First(&bal).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				bal = BalanceModel{
-					UserID:    userID,
-					Asset:     asset,
-					Available: amount,
-					Frozen:    0,
-					Total:     amount,
-				}
-				return tx.Create(&bal).Error
-			}
-			return err
+		// 尝试更新已有记录
+		result := tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ?", userID, asset).
+			Update("available", gorm.Expr("available + ?", amount))
+
+		if result.Error != nil {
+			return result.Error
 		}
-		bal.Available += amount
-		bal.Total = bal.Available + bal.Frozen
-		return tx.Save(&bal).Error
+
+		if result.RowsAffected > 0 {
+			// 同步更新 total = available + frozen
+			return tx.Model(&BalanceModel{}).
+				Where("user_id = ? AND asset = ?", userID, asset).
+				Update("total", gorm.Expr("available + frozen")).Error
+		}
+
+		// 不存在则创建
+		return tx.Create(&BalanceModel{
+			UserID:    userID,
+			Asset:     asset,
+			Available: amount,
+			Frozen:    0,
+			Total:     amount,
+		}).Error
 	})
 }
 
-// ========== 乐观锁扣减（重点） ==========
+// ========== 扣减 ==========
 
-// DeductBalance 扣减可用余额（乐观锁）
-// 用 WHERE available >= amount 保证不超卖
+// DeductBalance 扣减可用余额（条件更新）
 func (r *BalanceRepo) DeductBalance(userID, asset string, amount float64) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&BalanceModel{}).
@@ -86,44 +93,83 @@ func (r *BalanceRepo) DeductBalance(userID, asset string, amount float64) error 
 		if result.Error != nil {
 			return result.Error
 		}
-
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("余额不足或并发扣减冲突")
 		}
 
-		return nil
+		// 同步更新 total
+		return tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ?", userID, asset).
+			Update("total", gorm.Expr("available + frozen")).Error
 	})
 }
 
 // ========== 冻结 / 解冻 ==========
 
 // FreezeBalance 冻结余额（下单时调用）
+// ✅ 原子条件更新：WHERE available >= amount
 func (r *BalanceRepo) FreezeBalance(userID, asset string, amount float64) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		var bal BalanceModel
-		if err := tx.Where("user_id = ? AND asset = ?", userID, asset).First(&bal).Error; err != nil {
-			return err
+		result := tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ? AND available >= ?", userID, asset, amount).
+			Updates(map[string]interface{}{
+				"available": gorm.Expr("available - ?", amount),
+				"frozen":    gorm.Expr("frozen + ?", amount),
+			})
+
+		if result.Error != nil {
+			return result.Error
 		}
-		if bal.Available < amount {
-			return fmt.Errorf("余额不足")
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("余额不足或并发冻结冲突")
 		}
-		bal.Available -= amount
-		bal.Frozen += amount
-		bal.Total = bal.Available + bal.Frozen
-		return tx.Save(&bal).Error
+
+		// total 不变（available 减少，frozen 增加，总和不变）
+		return nil
 	})
 }
 
 // UnfreezeBalance 解冻余额（撤单/成交失败时调用）
+// ✅ 原子条件更新：WHERE frozen >= amount
 func (r *BalanceRepo) UnfreezeBalance(userID, asset string, amount float64) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		var bal BalanceModel
-		if err := tx.Where("user_id = ? AND asset = ?", userID, asset).First(&bal).Error; err != nil {
-			return err
+		result := tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ? AND frozen >= ?", userID, asset, amount).
+			Updates(map[string]interface{}{
+				"available": gorm.Expr("available + ?", amount),
+				"frozen":    gorm.Expr("frozen - ?", amount),
+			})
+
+		if result.Error != nil {
+			return result.Error
 		}
-		bal.Available += amount
-		bal.Frozen -= amount
-		bal.Total = bal.Available + bal.Frozen
-		return tx.Save(&bal).Error
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("冻结余额不足或并发解冻冲突")
+		}
+
+		// total 不变（available 增加，frozen 减少，总和不变）
+		return nil
+	})
+}
+
+// DeductFrozen 从冻结余额中扣减（成交后调用）
+// ✅ 先扣 frozen，再单独更新 total（避免同一 SQL 里旧值计算问题）
+func (r *BalanceRepo) DeductFrozen(userID, asset string, amount float64) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ? AND frozen >= ?", userID, asset, amount).
+			Update("frozen", gorm.Expr("frozen - ?", amount))
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("冻结余额不足")
+		}
+
+		// 同步更新 total = available + frozen
+		return tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ?", userID, asset).
+			Update("total", gorm.Expr("available + frozen")).Error
 	})
 }

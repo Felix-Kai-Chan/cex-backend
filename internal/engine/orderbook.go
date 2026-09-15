@@ -33,16 +33,20 @@ type OrderList struct {
 
 // OrderBook 订单簿
 type OrderBook struct {
-	bids map[int64]*OrderList // 买盘：价格 -> 订单链表
-	asks map[int64]*OrderList // 卖盘：价格 -> 订单链表
-	mu   sync.RWMutex
+	bids      map[int64]*OrderList // 买盘：价格 -> 订单链表
+	asks      map[int64]*OrderList // 卖盘：价格 -> 订单链表
+	bidPrices *SkipList            // ✅ 买盘跳表（降序）
+	askPrices *SkipList            // ✅ 卖盘跳表（升序）
+	mu        sync.RWMutex
 }
 
 // NewOrderBook 创建订单簿
 func NewOrderBook() *OrderBook {
 	return &OrderBook{
-		bids: make(map[int64]*OrderList),
-		asks: make(map[int64]*OrderList),
+		bids:      make(map[int64]*OrderList),
+		asks:      make(map[int64]*OrderList),
+		bidPrices: NewSkipList(false), // 降序
+		askPrices: NewSkipList(true),  // 升序
 	}
 }
 
@@ -52,17 +56,23 @@ func (ob *OrderBook) AddOrder(order *Order) {
 	defer ob.mu.Unlock()
 
 	var list *OrderList
+	var skip *SkipList
+
 	if order.Side == Buy {
 		list = ob.bids[order.Price]
+		skip = ob.bidPrices
 		if list == nil {
 			list = &OrderList{}
 			ob.bids[order.Price] = list
+			skip.Insert(order.Price, list) // ✅ 插入跳表
 		}
 	} else {
 		list = ob.asks[order.Price]
+		skip = ob.askPrices
 		if list == nil {
 			list = &OrderList{}
 			ob.asks[order.Price] = list
+			skip.Insert(order.Price, list) // ✅ 插入跳表
 		}
 	}
 
@@ -77,34 +87,29 @@ func (ob *OrderBook) AddOrder(order *Order) {
 }
 
 // BestBid 最佳买价（最高价）
+// ✅ 改从跳表读取，O(1)（跳表头节点就是最优价）
 func (ob *OrderBook) BestBid() int64 {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
 
-	var best int64
-	for price := range ob.bids {
-		if price > best {
-			best = price
-		}
+	node := ob.bidPrices.First()
+	if node == nil {
+		return 0
 	}
-	return best
+	return node.Price
 }
 
 // BestAsk 最佳卖价（最低价）
+// ✅ 改从跳表读取，O(1)（跳表头节点就是最优价）
 func (ob *OrderBook) BestAsk() int64 {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
 
-	var best int64 = 1<<63 - 1
-	for price := range ob.asks {
-		if price < best {
-			best = price
-		}
-	}
-	if best == 1<<63-1 {
+	node := ob.askPrices.First()
+	if node == nil {
 		return 0
 	}
-	return best
+	return node.Price
 }
 
 // CancelOrder 从订单簿中移除订单
@@ -118,9 +123,9 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 			continue
 		}
 		if removed := ob.removeFromList(list, orderID); removed != nil {
-			// 如果链表空了，删除这个价格档位
 			if list.Head == nil {
 				delete(ob.bids, price)
+				ob.bidPrices.Remove(price) // ✅ 从跳表移除
 			}
 			return removed, nil
 		}
@@ -134,6 +139,7 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 		if removed := ob.removeFromList(list, orderID); removed != nil {
 			if list.Head == nil {
 				delete(ob.asks, price)
+				ob.askPrices.Remove(price) // ✅ 从跳表移除
 			}
 			return removed, nil
 		}
@@ -148,7 +154,6 @@ func (ob *OrderBook) removeFromList(list *OrderList, orderID string) *Order {
 		return nil
 	}
 
-	// 如果头部就是要删的
 	if list.Head.ID == orderID {
 		removed := list.Head
 		list.Head = list.Head.Next
@@ -159,7 +164,6 @@ func (ob *OrderBook) removeFromList(list *OrderList, orderID string) *Order {
 		return removed
 	}
 
-	// 遍历查找
 	prev := list.Head
 	curr := prev.Next
 	for curr != nil {
@@ -193,6 +197,7 @@ type Depth struct {
 }
 
 // GetDepth 获取订单簿深度
+// ✅ 改从跳表读取，已有序，无需排序
 func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
@@ -203,8 +208,12 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 		Asks:   []DepthLevel{},
 	}
 
-	// 收集买盘（按价格从高到低）
-	for price, list := range ob.bids {
+	// ✅ 买盘从跳表读取（已按价格降序）
+	for _, node := range ob.bidPrices.GetAll() {
+		if limit > 0 && len(depth.Bids) >= limit {
+			break
+		}
+		list := node.List
 		if list == nil || list.Head == nil {
 			continue
 		}
@@ -215,14 +224,18 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 			count++
 		}
 		depth.Bids = append(depth.Bids, DepthLevel{
-			Price:      price,
+			Price:      node.Price,
 			Amount:     amount,
 			OrderCount: count,
 		})
 	}
 
-	// 收集卖盘（按价格从低到高）
-	for price, list := range ob.asks {
+	// ✅ 卖盘从跳表读取（已按价格升序）
+	for _, node := range ob.askPrices.GetAll() {
+		if limit > 0 && len(depth.Asks) >= limit {
+			break
+		}
+		list := node.List
 		if list == nil || list.Head == nil {
 			continue
 		}
@@ -233,16 +246,11 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 			count++
 		}
 		depth.Asks = append(depth.Asks, DepthLevel{
-			Price:      price,
+			Price:      node.Price,
 			Amount:     amount,
 			OrderCount: count,
 		})
 	}
-
-	// 排序：买盘从高到低，卖盘从低到高
-	// 这里简单处理，Go 排序需要 import sort
-	// 实际使用时可以排序，也可以不排（map 顺序随机）
-	// 为了演示，我们只取前 limit 个
 
 	return depth
 }

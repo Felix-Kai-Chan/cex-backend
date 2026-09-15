@@ -24,12 +24,30 @@ func main() {
 	}
 	repo := persistence.NewTradeRepo(db)
 	balanceRepo := persistence.NewBalanceRepo(db)
-	ledgerRepo := persistence.NewLedgerRepo(db) // ✅ 新增
+	ledgerRepo := persistence.NewLedgerRepo(db)
 
-	// 2.创建引擎（支持多交易对）
+	// 2. 创建引擎（支持多交易对）
 	eng := engine.NewEngine()
 
-	// 3. WebSocket Hub
+	// 3. ✅ 初始化 Redis（用于快照恢复）
+	rdb := engine.NewRedisClient("localhost:6379", "", 0)
+
+	// 4. ✅ 为每个交易对初始化 Snapshotter + 从 Redis/WAL 恢复订单簿
+	symbols := []string{"BTC/USDT", "ETH/USDT"}
+	for _, symbol := range symbols {
+		ob := eng.GetOrderBook(symbol)
+		snapshotter := engine.NewSnapshotter(rdb, ob, db, symbol)
+
+		// ✅ 启动时恢复：快照 → WAL → MySQL 对账
+		if err := snapshotter.Load(); err != nil {
+			log.Printf("⚠️ %s 订单簿恢复失败: %v", symbol, err)
+		}
+
+		// ✅ 启动定时快照（每 5 秒）
+		snapshotter.StartAutoSave()
+	}
+
+	// 5. WebSocket Hub
 	hub := websocket.NewHub()
 	go hub.Run()
 
@@ -37,14 +55,15 @@ func main() {
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
-	// 4. 初始化 Service 和 Handler
-	orderService := service.NewOrderService(eng, repo, ledgerRepo, hub) // ✅ 传入 ledgerRepo
+	// 6. 初始化 Service 和 Handler
+	// ✅ 传入 balanceRepo
+	orderService := service.NewOrderService(eng, repo, ledgerRepo, hub, balanceRepo)
 	orderHandler := handler.NewOrderHandler(orderService)
 	balanceHandler := handler.NewBalanceHandler(balanceRepo)
 	depthHandler := handler.NewDepthHandler(eng)
-	ledgerHandler := handler.NewLedgerHandler(ledgerRepo) // ✅ 新增
+	ledgerHandler := handler.NewLedgerHandler(ledgerRepo)
 
-	// 5. 设置 Gin 路由
+	// 7. 设置 Gin 路由
 	r := gin.Default()
 
 	r.GET("/health", func(c *gin.Context) {
@@ -96,7 +115,7 @@ func main() {
 
 		api.GET("/depth", depthHandler.GetDepth)
 
-		api.GET("/ledger/:user_id", ledgerHandler.GetLedgerByUser) // ✅ 新增流水路由
+		api.GET("/ledger/:user_id", ledgerHandler.GetLedgerByUser)
 	}
 
 	fmt.Println("🚀 CEX API 启动在 http://localhost:8080")
