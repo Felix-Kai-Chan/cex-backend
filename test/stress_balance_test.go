@@ -10,18 +10,21 @@ import (
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func setupTestDB(t *testing.T) *gorm.DB {
 	dsn := "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent), // ✅ 关闭 SQL 日志，避免 connection reset 刷屏
+	})
 	if err != nil {
 		t.Fatalf("MySQL 连接失败: %v", err)
 	}
 	// ✅ 调大连接池
 	sqlDB, _ := db.DB()
-	sqlDB.SetMaxOpenConns(200)
-	sqlDB.SetMaxIdleConns(50)
+	sqlDB.SetMaxOpenConns(500)
+	sqlDB.SetMaxIdleConns(100)
 	return db
 }
 
@@ -48,8 +51,8 @@ func TestConcurrentDeduct(t *testing.T) {
 
 	concurrency := 500
 	deductAmount := 10.0
-	expectedSuccess := int64(100 / deductAmount)         // ✅ 动态计算：10
-	expectedFail := int64(concurrency) - expectedSuccess // ✅ 动态计算：490
+	expectedSuccess := int64(100 / deductAmount)
+	expectedFail := int64(concurrency) - expectedSuccess
 
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {

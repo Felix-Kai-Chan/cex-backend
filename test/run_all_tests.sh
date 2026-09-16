@@ -27,11 +27,11 @@ echo -e "\n[1/4] E2E 功能测试..."
 
 # 2. 并发扣减
 echo -e "\n[2/4] 并发扣减测试..."
-go test -v ./test -run TestConcurrentDeduct
+go test -v -count=1 ./test -run TestConcurrentDeduct 2>&1 | grep -v "\[mysql\]"
 
 # 3. 撮合压测
 echo -e "\n[3/4] 撮合引擎压测..."
-go test -v ./test -run TestMatchEnginePerformance
+go test -v -count=1 ./test -run TestMatchEnginePerformance
 
 # 4. 崩溃恢复
 echo -e "\n[4/4] 崩溃恢复测试..."
