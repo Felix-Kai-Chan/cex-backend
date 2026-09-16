@@ -1,0 +1,22 @@
+# 编译产物
+cex-api
+*.exe
+*.test
+
+# 环境变量
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+
+# 临时文件
+/tmp/
