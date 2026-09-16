@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 
 	"cex-backend/internal/api/handler"
 	"cex-backend/internal/api/service"
@@ -22,8 +23,14 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	// ✅ 从环境变量读配置（本地默认值保留）
+	dsn := getEnv("MYSQL_DSN", "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local")
+	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	redisPassword := getEnv("REDIS_PASSWORD", "")
+	redisDB := getEnvInt("REDIS_DB", 0)
+	httpPort := getEnv("HTTP_PORT", "8080")
+
 	// 1. 连接 MySQL
-	dsn := "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
 	db, err := persistence.InitDB(dsn)
 	if err != nil {
 		slog.Error("MySQL 连接失败", "error", err)
@@ -37,7 +44,7 @@ func main() {
 	eng := engine.NewEngine()
 
 	// 3. ✅ 初始化 Redis（用于快照恢复）
-	rdb := engine.NewRedisClient("localhost:6379", "", 0)
+	rdb := engine.NewRedisClient(redisAddr, redisPassword, redisDB)
 
 	// 4. ✅ 为每个交易对初始化 Snapshotter + 从 Redis/WAL 恢复订单簿
 	symbols := []string{"BTC/USDT", "ETH/USDT"}
@@ -45,12 +52,10 @@ func main() {
 		ob := eng.GetOrderBook(symbol)
 		snapshotter := engine.NewSnapshotter(rdb, ob, db, symbol)
 
-		// ✅ 启动时恢复：快照 → WAL → MySQL 对账
 		if err := snapshotter.Load(); err != nil {
 			slog.Warn("订单簿恢复失败", "symbol", symbol, "error", err)
 		}
 
-		// ✅ 启动定时快照（每 5 秒）
 		snapshotter.StartAutoSave()
 	}
 
@@ -71,15 +76,14 @@ func main() {
 
 	// 7. 设置 Gin 路由
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()         // ✅ 不用 Default()，避免 Gin 默认日志
-	r.Use(gin.Recovery())  // ✅ 保留 panic 恢复
-	r.Use(RequestLogger()) // ✅ 用 slog 记录请求
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(RequestLogger())
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	// WebSocket 路由
 	r.GET("/ws", func(c *gin.Context) {
 		userID := c.Query("user_id")
 		if userID == "" {
@@ -105,12 +109,10 @@ func main() {
 		go client.ReadPump()
 	})
 
-	// 根路由
 	r.GET("/", func(c *gin.Context) {
 		c.String(200, "CEX API 运行中")
 	})
 
-	// API 路由
 	api := r.Group("/api/v1")
 	{
 		api.POST("/orders", orderHandler.CreateOrder)
@@ -127,8 +129,8 @@ func main() {
 		api.GET("/ledger/:user_id", ledgerHandler.GetLedgerByUser)
 	}
 
-	slog.Info("CEX API 启动", "addr", "http://localhost:8080")
-	r.Run(":8080")
+	slog.Info("CEX API 启动", "addr", "http://localhost:"+httpPort)
+	r.Run(":" + httpPort)
 }
 
 // ✅ RequestLogger 用 slog 记录 HTTP 请求
@@ -144,4 +146,22 @@ func RequestLogger() gin.HandlerFunc {
 			"client_ip", c.ClientIP(),
 		)
 	}
+}
+
+// ✅ getEnv 读环境变量，默认值兜底
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// ✅ getEnvInt 读 int 型环境变量
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if i, err := strconv.Atoi(value); err == nil {
+			return i
+		}
+	}
+	return defaultValue
 }

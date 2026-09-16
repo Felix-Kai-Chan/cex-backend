@@ -1,0 +1,77 @@
+services:
+  # ============================================
+  # MySQL
+  # ============================================
+  mysql:
+    image: mysql:8.0
+    container_name: cex-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: cex
+      TZ: Asia/Shanghai
+    ports:
+      - "13306:3306"   # 避免和本地 MySQL 冲突
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cex-network
+
+  # ============================================
+  # Redis
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: cex-redis
+    restart: always
+    ports:
+      - "16379:6379"   # 避免和本地 Redis 冲突
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --appendfsync everysec
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cex-network
+
+  # ============================================
+  # CEX API 服务
+  # ============================================
+  cex-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cex-api
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      MYSQL_DSN: "root:root@tcp(mysql:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      HTTP_PORT: "8080"
+      TZ: Asia/Shanghai
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - cex-network
+
+volumes:
+  mysql-data:
+  redis-data:
+
+networks:
+  cex-network:
+    driver: bridge

@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# 构建产物
+#cex-api
+*.exe
+
+# 日志
+*.log
+/tmp
+
+# 测试数据
+test/screenshots
+
+# 文档
+README.md
+*.md
+
+# 本地配置
+.env
