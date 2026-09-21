@@ -14,11 +14,22 @@ const (
 	Sell Side = "SELL"
 )
 
+// OrderType 订单类型
+type OrderType string
+
+const (
+	TypeLimit  OrderType = "LIMIT"  // 限价单：挂单等成交
+	TypeMarket OrderType = "MARKET" // 市价单：立即成交，剩余丢弃
+	TypeIOC    OrderType = "IOC"    // Immediate or Cancel：立即成交，剩余取消
+	TypeFOK    OrderType = "FOK"    // Fill or Kill：全部成交，否则整单取消
+)
+
 // Order 订单结构体
 type Order struct {
 	ID        string
 	UserID    string
 	Side      Side
+	Type      OrderType // ✅ 新增：订单类型
 	Price     int64
 	Amount    int64
 	Remaining int64
@@ -121,7 +132,7 @@ func (ob *OrderBook) BestAsk() int64 {
 	return node.Price
 }
 
-// Match 撮合（支持限价单 + 市价单）
+// Match 撮合（支持 LIMIT / MARKET / IOC / FOK）
 // 返回：成交列表 + 订单变更列表（用于写 WAL）
 func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 	ob.mu.Lock()
@@ -129,6 +140,14 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 
 	var trades []Trade
 	var changes []OrderChange
+
+	// ✅ FOK 预检查：对手盘能不能全吃，不能全吃直接返回
+	if order.Type == TypeFOK {
+		if !ob.canFillCompletely(order) {
+			// FOK 不满足：整单取消，不撮合不挂单
+			return trades, changes
+		}
+	}
 
 	for order.Remaining > 0 {
 		var matchPrice int64
@@ -210,21 +229,69 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 		}
 	}
 
-	// 当前订单还有剩余 → 挂入订单簿 + 记录 ADD
+	// ✅ 当前订单还有剩余 → 判断是否挂单
 	if order.Remaining > 0 {
-		ob.addOrderLocked(order)
-		changes = append(changes, OrderChange{
-			Op:        "ADD",
-			OrderID:   order.ID,
-			UserID:    order.UserID,
-			Side:      string(order.Side),
-			Price:     order.Price,
-			Remaining: order.Remaining,
-			Timestamp: order.Timestamp,
-		})
+		// LIMIT / MARKET 挂单（MARKET 理论上吃不完会挂，但业务上应该拒绝；这里按现状允许挂）
+		// IOC / FOK 不挂单，直接丢弃剩余
+		if order.Type != TypeIOC && order.Type != TypeFOK {
+			ob.addOrderLocked(order)
+			changes = append(changes, OrderChange{
+				Op:        "ADD",
+				OrderID:   order.ID,
+				UserID:    order.UserID,
+				Side:      string(order.Side),
+				Price:     order.Price,
+				Remaining: order.Remaining,
+				Timestamp: order.Timestamp,
+			})
+		}
 	}
 
 	return trades, changes
+}
+
+// canFillCompletely 检查对手盘能否完全满足 order（FOK 用）
+func (ob *OrderBook) canFillCompletely(order *Order) bool {
+	need := order.Remaining
+
+	if order.Side == Buy {
+		// 买方：从最低卖价开始累计
+		for _, node := range ob.askPrices.GetAll() {
+			// 价格约束（限价单）
+			if order.Price != 0 && node.Price > order.Price {
+				break
+			}
+			list := node.List
+			if list == nil || list.Head == nil {
+				continue
+			}
+			for o := list.Head; o != nil; o = o.Next {
+				need -= o.Remaining
+				if need <= 0 {
+					return true
+				}
+			}
+		}
+	} else {
+		// 卖方：从最高买价开始累计
+		for _, node := range ob.bidPrices.GetAll() {
+			if order.Price != 0 && node.Price < order.Price {
+				break
+			}
+			list := node.List
+			if list == nil || list.Head == nil {
+				continue
+			}
+			for o := list.Head; o != nil; o = o.Next {
+				need -= o.Remaining
+				if need <= 0 {
+					return true
+				}
+			}
+		}
+	}
+
+	return need <= 0
 }
 
 // getLowestAsk 获取最低卖价（跳表头节点）

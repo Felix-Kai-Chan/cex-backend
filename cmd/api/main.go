@@ -22,7 +22,7 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	dsn := getEnv("MYSQL_DSN", "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local")
+	dsn := getEnv("MYSQL_DSN", "root:root@tcp(127.0.0.1:13306)/cex?charset=utf8mb4&parseTime=True&loc=Local")
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
 	redisPassword := getEnv("REDIS_PASSWORD", "")
 	redisDB := getEnvInt("REDIS_DB", 0)
