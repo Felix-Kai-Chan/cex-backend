@@ -142,12 +142,30 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		Timestamp: time.Now().UnixMilli(),
 	}
 
-	_ = s.repo.SaveOrder(order.ID, order.UserID, req.Side, order.Price, order.Amount, order.Remaining, "PENDING")
+	_ = s.repo.SaveOrder(order.ID, order.UserID, req.Symbol, req.Side, order.Price, order.Amount, order.Remaining, "PENDING")
 
 	ob := s.eng.GetOrderBook(req.Symbol)
-	trades := ob.Match(order)
+	trades, changes := ob.Match(order)
 
-	// ✅ slog 结构化日志
+	// ✅ 写 WAL：把本次撮合产生的订单变更记录到 Redis
+	if snapshotter := s.eng.GetSnapshotter(req.Symbol); snapshotter != nil {
+		var walEntries []engine.WALEntry
+		for _, ch := range changes {
+			walEntries = append(walEntries, engine.WALEntry{
+				Op:        ch.Op,
+				OrderID:   ch.OrderID,
+				UserID:    ch.UserID,
+				Side:      ch.Side,
+				Price:     ch.Price,
+				Remaining: ch.Remaining,
+				Timestamp: ch.Timestamp,
+			})
+		}
+		if err := snapshotter.AppendWALBatch(walEntries); err != nil {
+			slog.Warn("写 WAL 失败", "order_id", order.ID, "error", err)
+		}
+	}
+
 	slog.Info("match completed",
 		"order_id", order.ID,
 		"user_id", order.UserID,
@@ -172,19 +190,15 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			trade.Timestamp,
 		)
 
-		// ✅ 余额操作
-		tradeAmount := float64(trade.Price * trade.Quantity) // USDT
-		tradeQty := float64(trade.Quantity)                  // BTC
+		tradeAmount := float64(trade.Price * trade.Quantity)
+		tradeQty := float64(trade.Quantity)
 
-		// 买方：扣 USDT，加 BTC
 		_ = s.balanceRepo.DeductFrozen(trade.BuyUserID, quoteAsset, tradeAmount)
 		_ = s.balanceRepo.AddBalance(trade.BuyUserID, baseAsset, tradeQty)
 
-		// 卖方：扣 BTC，加 USDT
 		_ = s.balanceRepo.DeductFrozen(trade.SellUserID, baseAsset, tradeQty)
 		_ = s.balanceRepo.AddBalance(trade.SellUserID, quoteAsset, tradeAmount)
 
-		// ✅ 更新买方订单状态
 		var buyerOrder persistence.OrderModel
 		if err := s.repo.GetOrderByID(trade.BuyOrder, &buyerOrder); err == nil {
 			newRemaining := buyerOrder.Remaining - trade.Quantity
@@ -197,7 +211,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			_ = s.repo.UpdateOrder(trade.BuyOrder, newRemaining, status)
 		}
 
-		// ✅ 更新卖方订单状态
 		var sellerOrder persistence.OrderModel
 		if err := s.repo.GetOrderByID(trade.SellOrder, &sellerOrder); err == nil {
 			newRemaining := sellerOrder.Remaining - trade.Quantity
@@ -210,7 +223,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			_ = s.repo.UpdateOrder(trade.SellOrder, newRemaining, status)
 		}
 
-		// ✅ 双边流水
 		_ = s.ledger.Record(
 			trade.BuyUserID, quoteAsset, -tradeAmount,
 			0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
@@ -223,7 +235,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		)
 	}
 
-	// ✅ 更新当前订单状态
 	status := "PENDING"
 	if order.Remaining == 0 {
 		status = "FILLED"
@@ -232,7 +243,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}
 	_ = s.repo.UpdateOrder(order.ID, order.Remaining, status)
 
-	// ✅ 部分成交：解冻未成交部分的冻结金额
 	if order.Remaining > 0 && order.Remaining < order.Amount {
 		var unfreezeAmount float64
 		var unfreezeAsset string
@@ -288,15 +298,33 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		return fmt.Errorf("订单已撤销")
 	}
 
-	ob := s.eng.GetOrderBook("BTC/USDT")
+	symbol := order.Symbol
+	if symbol == "" {
+		symbol = "BTC/USDT"
+	}
+
+	ob := s.eng.GetOrderBook(symbol)
 	_, _ = ob.CancelOrder(orderID)
 
 	if err := s.repo.CancelOrder(orderID); err != nil {
 		return err
 	}
 
-	baseAsset := getBaseAsset("BTC/USDT")
-	quoteAsset := getQuoteAsset("BTC/USDT")
+	// ✅ 写 WAL：撤单也是一次订单变更
+	if snapshotter := s.eng.GetSnapshotter(symbol); snapshotter != nil {
+		_ = snapshotter.AppendWAL(engine.WALEntry{
+			Op:        "REMOVE",
+			OrderID:   orderID,
+			UserID:    userID,
+			Side:      order.Side,
+			Price:     order.Price,
+			Remaining: 0,
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+
+	baseAsset := getBaseAsset(symbol)
+	quoteAsset := getQuoteAsset(symbol)
 
 	var unfreezeAmount float64
 	var unfreezeAsset string
@@ -310,7 +338,6 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	}
 
 	if err := s.balanceRepo.UnfreezeBalance(userID, unfreezeAsset, unfreezeAmount); err != nil {
-		// ✅ slog 结构化日志
 		slog.Warn("unfreeze failed",
 			"order_id", orderID,
 			"user_id", userID,

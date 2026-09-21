@@ -17,13 +17,11 @@ import (
 )
 
 func main() {
-	// ✅ 初始化 slog（JSON 格式，INFO 级别）
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	// ✅ 从环境变量读配置（本地默认值保留）
 	dsn := getEnv("MYSQL_DSN", "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local")
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
 	redisPassword := getEnv("REDIS_PASSWORD", "")
@@ -40,13 +38,13 @@ func main() {
 	balanceRepo := persistence.NewBalanceRepo(db)
 	ledgerRepo := persistence.NewLedgerRepo(db)
 
-	// 2. 创建引擎（支持多交易对）
+	// 2. 创建引擎
 	eng := engine.NewEngine()
 
-	// 3. ✅ 初始化 Redis（用于快照恢复）
+	// 3. 初始化 Redis
 	rdb := engine.NewRedisClient(redisAddr, redisPassword, redisDB)
 
-	// 4. ✅ 为每个交易对初始化 Snapshotter + 从 Redis/WAL 恢复订单簿
+	// 4. 为每个交易对初始化 Snapshotter + 恢复 + 注册
 	symbols := []string{"BTC/USDT", "ETH/USDT"}
 	for _, symbol := range symbols {
 		ob := eng.GetOrderBook(symbol)
@@ -55,6 +53,9 @@ func main() {
 		if err := snapshotter.Load(); err != nil {
 			slog.Warn("订单簿恢复失败", "symbol", symbol, "error", err)
 		}
+
+		// ✅ 注册到 engine，供 service 层获取
+		eng.RegisterSnapshotter(symbol, snapshotter)
 
 		snapshotter.StartAutoSave()
 	}
@@ -67,14 +68,14 @@ func main() {
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
-	// 6. 初始化 Service 和 Handler
+	// 6. Service + Handler
 	orderService := service.NewOrderService(eng, repo, ledgerRepo, hub, balanceRepo)
 	orderHandler := handler.NewOrderHandler(orderService)
 	balanceHandler := handler.NewBalanceHandler(balanceRepo)
 	depthHandler := handler.NewDepthHandler(eng)
 	ledgerHandler := handler.NewLedgerHandler(ledgerRepo)
 
-	// 7. 设置 Gin 路由
+	// 7. Gin 路由
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -133,7 +134,6 @@ func main() {
 	r.Run(":" + httpPort)
 }
 
-// ✅ RequestLogger 用 slog 记录 HTTP 请求
 func RequestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Next()
@@ -148,7 +148,6 @@ func RequestLogger() gin.HandlerFunc {
 	}
 }
 
-// ✅ getEnv 读环境变量，默认值兜底
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -156,7 +155,6 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// ✅ getEnvInt 读 int 型环境变量
 func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if i, err := strconv.Atoi(value); err == nil {

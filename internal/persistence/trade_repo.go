@@ -11,7 +11,8 @@ type OrderModel struct {
 	ID        uint   `gorm:"primaryKey"`
 	OrderID   string `gorm:"uniqueIndex;size:64"`
 	UserID    string `gorm:"index;size:64"`
-	Side      string `gorm:"size:8"` // BUY / SELL
+	Symbol    string `gorm:"index;size:32"` // ✅ 新增：交易对
+	Side      string `gorm:"size:8"`        // BUY / SELL
 	Price     int64
 	Amount    int64
 	Remaining int64
@@ -51,10 +52,12 @@ func NewTradeRepo(db *gorm.DB) *TradeRepo {
 }
 
 // SaveOrder 保存订单
-func (r *TradeRepo) SaveOrder(orderID, userID, side string, price, amount, remaining int64, status string) error {
+// ✅ 新增 symbol 参数
+func (r *TradeRepo) SaveOrder(orderID, userID, symbol, side string, price, amount, remaining int64, status string) error {
 	order := OrderModel{
 		OrderID:   orderID,
 		UserID:    userID,
+		Symbol:    symbol,
 		Side:      side,
 		Price:     price,
 		Amount:    amount,

@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Side 买卖方向
@@ -18,11 +19,11 @@ type Order struct {
 	ID        string
 	UserID    string
 	Side      Side
-	Price     int64  // 用 int64 避免浮点精度
-	Amount    int64  // 原始数量
-	Remaining int64  // 剩余未成交数量
-	Timestamp int64  // 下单时间戳（毫秒）
-	Next      *Order // 链表指针
+	Price     int64
+	Amount    int64
+	Remaining int64
+	Timestamp int64
+	Next      *Order
 }
 
 // OrderList 价格链表（同价格按时间排序）
@@ -31,12 +32,23 @@ type OrderList struct {
 	Tail *Order
 }
 
+// OrderChange 订单变更事件（用于写 WAL）
+type OrderChange struct {
+	Op        string // "ADD" / "REMOVE"
+	OrderID   string
+	UserID    string
+	Side      string
+	Price     int64
+	Remaining int64
+	Timestamp int64
+}
+
 // OrderBook 订单簿
 type OrderBook struct {
-	bids      map[int64]*OrderList // 买盘：价格 -> 订单链表
-	asks      map[int64]*OrderList // 卖盘：价格 -> 订单链表
-	bidPrices *SkipList            // ✅ 买盘跳表（降序）
-	askPrices *SkipList            // ✅ 卖盘跳表（升序）
+	bids      map[int64]*OrderList
+	asks      map[int64]*OrderList
+	bidPrices *SkipList
+	askPrices *SkipList
 	mu        sync.RWMutex
 }
 
@@ -45,8 +57,8 @@ func NewOrderBook() *OrderBook {
 	return &OrderBook{
 		bids:      make(map[int64]*OrderList),
 		asks:      make(map[int64]*OrderList),
-		bidPrices: NewSkipList(false), // 降序
-		askPrices: NewSkipList(true),  // 升序
+		bidPrices: NewSkipList(false),
+		askPrices: NewSkipList(true),
 	}
 }
 
@@ -54,29 +66,28 @@ func NewOrderBook() *OrderBook {
 func (ob *OrderBook) AddOrder(order *Order) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	ob.addOrderLocked(order)
+}
 
+// addOrderLocked 内部使用，不加锁
+func (ob *OrderBook) addOrderLocked(order *Order) {
 	var list *OrderList
-	var skip *SkipList
-
 	if order.Side == Buy {
 		list = ob.bids[order.Price]
-		skip = ob.bidPrices
 		if list == nil {
 			list = &OrderList{}
 			ob.bids[order.Price] = list
-			skip.Insert(order.Price, list) // ✅ 插入跳表
+			ob.bidPrices.Insert(order.Price, list)
 		}
 	} else {
 		list = ob.asks[order.Price]
-		skip = ob.askPrices
 		if list == nil {
 			list = &OrderList{}
 			ob.asks[order.Price] = list
-			skip.Insert(order.Price, list) // ✅ 插入跳表
+			ob.askPrices.Insert(order.Price, list)
 		}
 	}
 
-	// 尾插：按时间顺序
 	if list.Head == nil {
 		list.Head = order
 		list.Tail = order
@@ -86,8 +97,7 @@ func (ob *OrderBook) AddOrder(order *Order) {
 	}
 }
 
-// BestBid 最佳买价（最高价）
-// ✅ 改从跳表读取，O(1)（跳表头节点就是最优价）
+// BestBid 最佳买价
 func (ob *OrderBook) BestBid() int64 {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
@@ -99,8 +109,7 @@ func (ob *OrderBook) BestBid() int64 {
 	return node.Price
 }
 
-// BestAsk 最佳卖价（最低价）
-// ✅ 改从跳表读取，O(1)（跳表头节点就是最优价）
+// BestAsk 最佳卖价
 func (ob *OrderBook) BestAsk() int64 {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
@@ -110,6 +119,130 @@ func (ob *OrderBook) BestAsk() int64 {
 		return 0
 	}
 	return node.Price
+}
+
+// Match 撮合（支持限价单 + 市价单）
+// 返回：成交列表 + 订单变更列表（用于写 WAL）
+func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
+	var trades []Trade
+	var changes []OrderChange
+
+	for order.Remaining > 0 {
+		var matchPrice int64
+		var matchList *OrderList
+
+		if order.Side == Buy {
+			matchPrice, matchList = ob.getLowestAsk()
+			if matchList == nil {
+				break
+			}
+			if order.Price != 0 && matchPrice > order.Price {
+				break
+			}
+		} else {
+			matchPrice, matchList = ob.getHighestBid()
+			if matchList == nil {
+				break
+			}
+			if order.Price != 0 && matchPrice < order.Price {
+				break
+			}
+		}
+
+		if matchList == nil || matchList.Head == nil {
+			break
+		}
+
+		matchOrder := matchList.Head
+		qty := min(order.Remaining, matchOrder.Remaining)
+
+		trade := Trade{
+			TradeID:   fmt.Sprintf("trade_%d", time.Now().UnixNano()),
+			Price:     matchPrice,
+			Quantity:  qty,
+			Timestamp: time.Now().UnixMilli(),
+		}
+
+		if order.Side == Buy {
+			trade.BuyOrder = order.ID
+			trade.BuyUserID = order.UserID
+			trade.SellOrder = matchOrder.ID
+			trade.SellUserID = matchOrder.UserID
+		} else {
+			trade.BuyOrder = matchOrder.ID
+			trade.BuyUserID = matchOrder.UserID
+			trade.SellOrder = order.ID
+			trade.SellUserID = order.UserID
+		}
+
+		trades = append(trades, trade)
+
+		order.Remaining -= qty
+		matchOrder.Remaining -= qty
+
+		// 对手单被吃完 → 从订单簿移除 + 记录 REMOVE
+		if matchOrder.Remaining == 0 {
+			matchList.Head = matchOrder.Next
+			if matchList.Head == nil {
+				matchList.Tail = nil
+				if order.Side == Buy {
+					delete(ob.asks, matchPrice)
+					ob.askPrices.Remove(matchPrice)
+				} else {
+					delete(ob.bids, matchPrice)
+					ob.bidPrices.Remove(matchPrice)
+				}
+			}
+			matchOrder.Next = nil
+
+			changes = append(changes, OrderChange{
+				Op:        "REMOVE",
+				OrderID:   matchOrder.ID,
+				UserID:    matchOrder.UserID,
+				Side:      string(matchOrder.Side),
+				Price:     matchOrder.Price,
+				Remaining: 0,
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+	}
+
+	// 当前订单还有剩余 → 挂入订单簿 + 记录 ADD
+	if order.Remaining > 0 {
+		ob.addOrderLocked(order)
+		changes = append(changes, OrderChange{
+			Op:        "ADD",
+			OrderID:   order.ID,
+			UserID:    order.UserID,
+			Side:      string(order.Side),
+			Price:     order.Price,
+			Remaining: order.Remaining,
+			Timestamp: order.Timestamp,
+		})
+	}
+
+	return trades, changes
+}
+
+// getLowestAsk 获取最低卖价（跳表头节点）
+func (ob *OrderBook) getLowestAsk() (int64, *OrderList) {
+	node := ob.askPrices.First()
+	if node == nil || node.List == nil || node.List.Head == nil {
+		return 0, nil
+	}
+	return node.Price, node.List
+}
+
+// getHighestBid 获取最高买价（跳表头节点）
+func (ob *OrderBook) getHighestBid() (int64, *OrderList) {
+	node := ob.bidPrices.First()
+	if node == nil || node.List == nil || node.List.Head == nil {
+		return 0, nil
+	}
+	return node.Price, node.List
 }
 
 // CancelOrder 从订单簿中移除订单
@@ -125,7 +258,7 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 		if removed := ob.removeFromList(list, orderID); removed != nil {
 			if list.Head == nil {
 				delete(ob.bids, price)
-				ob.bidPrices.Remove(price) // ✅ 从跳表移除
+				ob.bidPrices.Remove(price)
 			}
 			return removed, nil
 		}
@@ -139,7 +272,7 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 		if removed := ob.removeFromList(list, orderID); removed != nil {
 			if list.Head == nil {
 				delete(ob.asks, price)
-				ob.askPrices.Remove(price) // ✅ 从跳表移除
+				ob.askPrices.Remove(price)
 			}
 			return removed, nil
 		}
@@ -197,7 +330,6 @@ type Depth struct {
 }
 
 // GetDepth 获取订单簿深度
-// ✅ 改从跳表读取，已有序，无需排序
 func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
@@ -208,7 +340,6 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 		Asks:   []DepthLevel{},
 	}
 
-	// ✅ 买盘从跳表读取（已按价格降序）
 	for _, node := range ob.bidPrices.GetAll() {
 		if limit > 0 && len(depth.Bids) >= limit {
 			break
@@ -230,7 +361,6 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 		})
 	}
 
-	// ✅ 卖盘从跳表读取（已按价格升序）
 	for _, node := range ob.askPrices.GetAll() {
 		if limit > 0 && len(depth.Asks) >= limit {
 			break
@@ -253,4 +383,11 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 	}
 
 	return depth
+}
+
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }

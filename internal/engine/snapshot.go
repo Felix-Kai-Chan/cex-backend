@@ -62,16 +62,19 @@ func NewSnapshotter(rdb *redis.Client, ob *OrderBook, db *gorm.DB, symbol string
 }
 
 // Save 保存快照到 Redis
+// ✅ 锁内深拷贝，锁外序列化 + 写 Redis（避免锁内 IO）
+// ✅ 快照存成功，内存状态已被覆盖，WAL 可以全清
 func (s *Snapshotter) Save() error {
+	// 1. 锁内深拷贝
 	s.ob.mu.RLock()
-	defer s.ob.mu.RUnlock()
-
 	snapshot := Snapshot{
 		Bids:      s.convertOrderBook(s.ob.bids),
 		Asks:      s.convertOrderBook(s.ob.asks),
 		Timestamp: time.Now().Unix(),
 	}
+	s.ob.mu.RUnlock()
 
+	// 2. 锁外序列化 + 写 Redis
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -81,6 +84,7 @@ func (s *Snapshotter) Save() error {
 		return err
 	}
 
+	// 3. 快照存成功，内存状态已被覆盖，WAL 全部可清
 	s.TruncateWAL()
 	return nil
 }
@@ -123,6 +127,23 @@ func (s *Snapshotter) AppendWAL(entry WALEntry) error {
 		return err
 	}
 	return s.rdb.RPush(context.Background(), s.walKey, data).Err()
+}
+
+// AppendWALBatch 批量追加 WAL 操作日志（Pipeline）
+func (s *Snapshotter) AppendWALBatch(entries []WALEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	pipe := s.rdb.Pipeline()
+	for _, e := range entries {
+		data, err := json.Marshal(e)
+		if err != nil {
+			continue
+		}
+		pipe.RPush(context.Background(), s.walKey, data)
+	}
+	_, err := pipe.Exec(context.Background())
+	return err
 }
 
 // ReplayWAL 回放 WAL 操作日志
@@ -196,9 +217,9 @@ func (s *Snapshotter) rebuildFromDB() error {
 	}
 
 	query := `SELECT order_id, user_id, side, price, remaining, created_at 
-	          FROM orders 
-	          WHERE status IN ('PENDING', 'PARTIAL') 
-	          ORDER BY created_at ASC`
+              FROM orders 
+              WHERE status IN ('PENDING', 'PARTIAL') 
+              ORDER BY created_at ASC`
 
 	if err := s.db.Raw(query).Scan(&orders).Error; err != nil {
 		return fmt.Errorf("从 MySQL 重建订单簿失败: %w", err)
@@ -246,9 +267,9 @@ func (s *Snapshotter) Reconcile() error {
 	}
 
 	query := `SELECT order_id, user_id, side, price, remaining, created_at 
-	          FROM orders 
-	          WHERE status IN ('PENDING', 'PARTIAL') 
-	          ORDER BY created_at ASC`
+              FROM orders 
+              WHERE status IN ('PENDING', 'PARTIAL') 
+              ORDER BY created_at ASC`
 
 	if err := s.db.Raw(query).Scan(&dbOrders).Error; err != nil {
 		return fmt.Errorf("对账查询失败: %w", err)
