@@ -55,7 +55,7 @@ func TestMatchEnginePerformance(t *testing.T) {
 			}
 
 			orderStart := time.Now()
-			trades := ob.Match(order)
+			trades, _ := ob.Match(order)
 			latency := time.Since(orderStart).Microseconds()
 
 			atomic.AddInt64(&totalTrades, int64(len(trades)))
