@@ -18,10 +18,10 @@ const (
 type OrderType string
 
 const (
-	TypeLimit  OrderType = "LIMIT"  // 限价单：挂单等成交
-	TypeMarket OrderType = "MARKET" // 市价单：立即成交，剩余丢弃
-	TypeIOC    OrderType = "IOC"    // Immediate or Cancel：立即成交，剩余取消
-	TypeFOK    OrderType = "FOK"    // Fill or Kill：全部成交，否则整单取消
+	TypeLimit  OrderType = "LIMIT"
+	TypeMarket OrderType = "MARKET"
+	TypeIOC    OrderType = "IOC"
+	TypeFOK    OrderType = "FOK"
 )
 
 // Order 订单结构体
@@ -29,7 +29,7 @@ type Order struct {
 	ID        string
 	UserID    string
 	Side      Side
-	Type      OrderType // ✅ 新增：订单类型
+	Type      OrderType
 	Price     int64
 	Amount    int64
 	Remaining int64
@@ -45,7 +45,7 @@ type OrderList struct {
 
 // OrderChange 订单变更事件（用于写 WAL）
 type OrderChange struct {
-	Op        string // "ADD" / "REMOVE"
+	Op        string
 	OrderID   string
 	UserID    string
 	Side      string
@@ -60,6 +60,7 @@ type OrderBook struct {
 	asks      map[int64]*OrderList
 	bidPrices *SkipList
 	askPrices *SkipList
+	orders    map[string]*Order // ✅ OrderID → Order 节点索引，撤单 O(1)
 	mu        sync.RWMutex
 }
 
@@ -70,6 +71,7 @@ func NewOrderBook() *OrderBook {
 		asks:      make(map[int64]*OrderList),
 		bidPrices: NewSkipList(false),
 		askPrices: NewSkipList(true),
+		orders:    make(map[string]*Order),
 	}
 }
 
@@ -106,6 +108,9 @@ func (ob *OrderBook) addOrderLocked(order *Order) {
 		list.Tail.Next = order
 		list.Tail = order
 	}
+
+	// ✅ 写索引
+	ob.orders[order.ID] = order
 }
 
 // BestBid 最佳买价
@@ -133,7 +138,6 @@ func (ob *OrderBook) BestAsk() int64 {
 }
 
 // Match 撮合（支持 LIMIT / MARKET / IOC / FOK）
-// 返回：成交列表 + 订单变更列表（用于写 WAL）
 func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
@@ -141,10 +145,9 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 	var trades []Trade
 	var changes []OrderChange
 
-	// ✅ FOK 预检查：对手盘能不能全吃，不能全吃直接返回
+	// FOK 预检查
 	if order.Type == TypeFOK {
 		if !ob.canFillCompletely(order) {
-			// FOK 不满足：整单取消，不撮合不挂单
 			return trades, changes
 		}
 	}
@@ -217,6 +220,9 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 			}
 			matchOrder.Next = nil
 
+			// ✅ 删索引
+			delete(ob.orders, matchOrder.ID)
+
 			changes = append(changes, OrderChange{
 				Op:        "REMOVE",
 				OrderID:   matchOrder.ID,
@@ -229,10 +235,8 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 		}
 	}
 
-	// ✅ 当前订单还有剩余 → 判断是否挂单
+	// 当前订单还有剩余 → 判断是否挂单
 	if order.Remaining > 0 {
-		// LIMIT / MARKET 挂单（MARKET 理论上吃不完会挂，但业务上应该拒绝；这里按现状允许挂）
-		// IOC / FOK 不挂单，直接丢弃剩余
 		if order.Type != TypeIOC && order.Type != TypeFOK {
 			ob.addOrderLocked(order)
 			changes = append(changes, OrderChange{
@@ -255,9 +259,7 @@ func (ob *OrderBook) canFillCompletely(order *Order) bool {
 	need := order.Remaining
 
 	if order.Side == Buy {
-		// 买方：从最低卖价开始累计
 		for _, node := range ob.askPrices.GetAll() {
-			// 价格约束（限价单）
 			if order.Price != 0 && node.Price > order.Price {
 				break
 			}
@@ -273,7 +275,6 @@ func (ob *OrderBook) canFillCompletely(order *Order) bool {
 			}
 		}
 	} else {
-		// 卖方：从最高买价开始累计
 		for _, node := range ob.bidPrices.GetAll() {
 			if order.Price != 0 && node.Price < order.Price {
 				break
@@ -312,40 +313,54 @@ func (ob *OrderBook) getHighestBid() (int64, *OrderList) {
 	return node.Price, node.List
 }
 
-// CancelOrder 从订单簿中移除订单
+// CancelOrder 从订单簿中移除订单（✅ O(1) 索引定位）
 func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	// 从买盘找
-	for price, list := range ob.bids {
-		if list == nil || list.Head == nil {
-			continue
-		}
-		if removed := ob.removeFromList(list, orderID); removed != nil {
-			if list.Head == nil {
-				delete(ob.bids, price)
-				ob.bidPrices.Remove(price)
-			}
-			return removed, nil
+	// ✅ O(1) 从索引查
+	order, ok := ob.orders[orderID]
+	if !ok {
+		return nil, fmt.Errorf("订单不在订单簿中")
+	}
+
+	// 根据 side 找到对应的价格档
+	var list *OrderList
+	if order.Side == Buy {
+		list = ob.bids[order.Price]
+	} else {
+		list = ob.asks[order.Price]
+	}
+
+	if list == nil || list.Head == nil {
+		// 索引有但链表空，说明数据不一致，清理索引
+		delete(ob.orders, orderID)
+		return nil, fmt.Errorf("订单不在订单簿中")
+	}
+
+	// 从链表摘掉
+	removed := ob.removeFromList(list, orderID)
+	if removed == nil {
+		// 链表里没找到，清索引
+		delete(ob.orders, orderID)
+		return nil, fmt.Errorf("订单不在订单簿中")
+	}
+
+	// 价格档空了 → 从 map + 跳表删
+	if list.Head == nil {
+		if order.Side == Buy {
+			delete(ob.bids, order.Price)
+			ob.bidPrices.Remove(order.Price)
+		} else {
+			delete(ob.asks, order.Price)
+			ob.askPrices.Remove(order.Price)
 		}
 	}
 
-	// 从卖盘找
-	for price, list := range ob.asks {
-		if list == nil || list.Head == nil {
-			continue
-		}
-		if removed := ob.removeFromList(list, orderID); removed != nil {
-			if list.Head == nil {
-				delete(ob.asks, price)
-				ob.askPrices.Remove(price)
-			}
-			return removed, nil
-		}
-	}
+	// ✅ 删索引
+	delete(ob.orders, orderID)
 
-	return nil, fmt.Errorf("订单不在订单簿中")
+	return removed, nil
 }
 
 // removeFromList 从链表中移除订单
