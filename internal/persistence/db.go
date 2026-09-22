@@ -34,6 +34,7 @@ func InitDB(dsn string) (*gorm.DB, error) {
 		&TradeModel{},
 		&BalanceModel{},
 		&LedgerModel{},
+		&OutboxModel{}, // ✅ 新增
 	); err != nil {
 		return nil, err
 	}

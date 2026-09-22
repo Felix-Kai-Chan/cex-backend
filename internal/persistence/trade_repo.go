@@ -121,3 +121,18 @@ func (r *TradeRepo) CancelOrder(orderID string) error {
 			"updated_at": time.Now(),
 		}).Error
 }
+
+// SaveOrderTx 在指定事务内保存订单
+func (r *TradeRepo) SaveOrderTx(tx *gorm.DB, orderID, userID, symbol, side string, price, amount, remaining int64, status string) error {
+	order := OrderModel{
+		OrderID:   orderID,
+		UserID:    userID,
+		Symbol:    symbol,
+		Side:      side,
+		Price:     price,
+		Amount:    amount,
+		Remaining: remaining,
+		Status:    status,
+	}
+	return tx.Create(&order).Error
+}
