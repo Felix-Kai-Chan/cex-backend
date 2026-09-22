@@ -11,7 +11,7 @@ services:
       MYSQL_DATABASE: cex
       TZ: Asia/Shanghai
     ports:
-      - "13306:3306"   # 避免和本地 MySQL 冲突
+      - "13306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -30,7 +30,7 @@ services:
     container_name: cex-redis
     restart: always
     ports:
-      - "16379:6379"   # 避免和本地 Redis 冲突
+      - "16379:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes --appendfsync everysec
@@ -39,6 +39,41 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - cex-network
+
+  # ============================================
+  # Kafka（KRaft 模式，无需 ZooKeeper）
+  # 双 listener：容器内用 PLAINTEXT:9092，宿主机用 EXTERNAL:19092
+  # ============================================
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: cex-kafka
+    restart: always
+    ports:
+      - "19092:9094"   # EXTERNAL listener 映射到宿主机
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     networks:
       - cex-network
 
@@ -59,11 +94,15 @@ services:
       REDIS_PASSWORD: ""
       REDIS_DB: "0"
       HTTP_PORT: "8080"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "cex.order.events"
       TZ: Asia/Shanghai
     depends_on:
       mysql:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     networks:
       - cex-network
@@ -71,6 +110,7 @@ services:
 volumes:
   mysql-data:
   redis-data:
+  kafka-data:
 
 networks:
   cex-network:
