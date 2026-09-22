@@ -37,6 +37,7 @@ func main() {
 	repo := persistence.NewTradeRepo(db)
 	balanceRepo := persistence.NewBalanceRepo(db)
 	ledgerRepo := persistence.NewLedgerRepo(db)
+	outboxRepo := persistence.NewOutboxRepo(db) // ✅ 新增
 
 	// 2. 创建引擎
 	eng := engine.NewEngine()
@@ -54,7 +55,6 @@ func main() {
 			slog.Warn("订单簿恢复失败", "symbol", symbol, "error", err)
 		}
 
-		// ✅ 注册到 engine，供 service 层获取
 		eng.RegisterSnapshotter(symbol, snapshotter)
 
 		snapshotter.StartAutoSave()
@@ -69,7 +69,8 @@ func main() {
 	}
 
 	// 6. Service + Handler
-	orderService := service.NewOrderService(eng, repo, ledgerRepo, hub, balanceRepo)
+	// ✅ 新增 db 和 outboxRepo 两个参数
+	orderService := service.NewOrderService(eng, repo, ledgerRepo, hub, balanceRepo, db, outboxRepo)
 	orderHandler := handler.NewOrderHandler(orderService)
 	balanceHandler := handler.NewBalanceHandler(balanceRepo)
 	depthHandler := handler.NewDepthHandler(eng)
@@ -85,7 +86,7 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	// ✅ 新增：监控指标接口
+	// ✅ 监控指标接口
 	r.GET("/metrics", func(c *gin.Context) {
 		metricsSnap := eng.GetMetrics().Snapshot()
 		breakerStatus := eng.GetBreakerStatus()

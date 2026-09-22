@@ -1,14 +1,19 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
 	"cex-backend/internal/engine"
+	"cex-backend/internal/mq"
 	"cex-backend/internal/persistence"
 	"cex-backend/internal/websocket"
+
+	"gorm.io/gorm"
 )
 
 func getBaseAsset(symbol string) string {
@@ -33,6 +38,9 @@ type OrderService struct {
 	ledger      *persistence.LedgerRepo
 	hub         *websocket.Hub
 	balanceRepo *persistence.BalanceRepo
+	db          *gorm.DB                // ✅ 新增：事务用
+	outboxRepo  *persistence.OutboxRepo // ✅ 新增：写 outbox
+	kafkaTopic  string                  // ✅ 新增：Kafka topic
 }
 
 func NewOrderService(
@@ -41,13 +49,22 @@ func NewOrderService(
 	ledger *persistence.LedgerRepo,
 	hub *websocket.Hub,
 	balanceRepo *persistence.BalanceRepo,
+	db *gorm.DB,
+	outboxRepo *persistence.OutboxRepo,
 ) *OrderService {
+	topic := os.Getenv("KAFKA_TOPIC")
+	if topic == "" {
+		topic = "cex.order.events"
+	}
 	return &OrderService{
 		eng:         eng,
 		repo:        repo,
 		ledger:      ledger,
 		hub:         hub,
 		balanceRepo: balanceRepo,
+		db:          db,
+		outboxRepo:  outboxRepo,
+		kafkaTopic:  topic,
 	}
 }
 
@@ -87,7 +104,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("amount 必须大于 0")
 	}
 
-	// ✅ 2. 熔断检查（新增）
+	// 2. 熔断检查
 	breaker := s.eng.GetBreaker(req.Symbol)
 	if breaker.IsOpen() {
 		_, remainSec, lastPrice := breaker.Status()
@@ -183,15 +200,20 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		Timestamp: time.Now().UnixMilli(),
 	}
 
-	_ = s.repo.SaveOrder(order.ID, order.UserID, req.Symbol, req.Side, order.Price, order.Amount, order.Remaining, "PENDING")
+	// ✅ 6.1 同事务写 order + outbox
+	if err := s.saveOrderWithOutbox(order, req); err != nil {
+		// 回滚：解冻
+		_ = s.balanceRepo.UnfreezeBalance(req.UserID, freezeAsset, freezeAmount)
+		return nil, fmt.Errorf("订单创建失败: %w", err)
+	}
 
-	// ✅ 7. 撮合（新增：记耗时）
+	// 7. 撮合（记耗时）
 	ob := s.eng.GetOrderBook(req.Symbol)
 	matchStart := time.Now()
 	trades, changes := ob.Match(order)
 	matchDuration := time.Since(matchStart)
 
-	// ✅ 8. 记 metrics + 更新熔断器（新增）
+	// 8. 记 metrics + 更新熔断器
 	s.eng.GetMetrics().Record(matchDuration)
 	for _, trade := range trades {
 		breaker.UpdatePrice(trade.Price)
@@ -223,7 +245,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		"order_type", req.OrderType,
 		"trades", len(trades),
 		"remaining", order.Remaining,
-		"match_us", matchDuration.Microseconds(), // ✅ 新增
+		"match_us", matchDuration.Microseconds(),
 	)
 
 	// 10. 处理成交
@@ -336,6 +358,58 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}, nil
 }
 
+// saveOrderWithOutbox 同事务写 order + outbox
+func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrderRequest) error {
+	tx := s.db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	// 1. 写 order
+	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, order.Price, order.Amount, order.Remaining, "PENDING"); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// 2. 构造 outbox 消息
+	event := mq.OrderEvent{
+		EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType: mq.EventOrderCreated,
+		OrderID:   order.ID,
+		UserID:    order.UserID,
+		Symbol:    req.Symbol,
+		Side:      string(order.Side),
+		Price:     order.Price,
+		Amount:    order.Amount,
+		Status:    "PENDING",
+		Timestamp: order.Timestamp,
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	outboxMsg := &persistence.OutboxModel{
+		AggregateID: order.ID,
+		Topic:       s.kafkaTopic,
+		Payload:     string(payload),
+		Status:      "PENDING",
+	}
+	if err := s.outboxRepo.Create(tx, outboxMsg); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit().Error
+}
+
 func (s *OrderService) GetOrder(orderID string) (*persistence.OrderModel, error) {
 	var order persistence.OrderModel
 	err := s.repo.GetOrderByID(orderID, &order)
@@ -378,7 +452,7 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		return err
 	}
 
-	// 写 WAL：撤单也是一次订单变更
+	// 写 WAL
 	if snapshotter := s.eng.GetSnapshotter(symbol); snapshotter != nil {
 		_ = snapshotter.AppendWAL(engine.WALEntry{
 			Op:        "REMOVE",
@@ -390,6 +464,9 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 			Timestamp: time.Now().UnixMilli(),
 		})
 	}
+
+	// ✅ 写 outbox（撤单事件）
+	go s.writeCancelOutbox(orderID, userID, symbol, order.Side, order.Price, order.Remaining)
 
 	baseAsset := getBaseAsset(symbol)
 	quoteAsset := getQuoteAsset(symbol)
@@ -427,4 +504,43 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	})
 
 	return nil
+}
+
+// writeCancelOutbox 写撤单事件到 outbox（异步，best effort）
+func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, price, remaining int64) {
+	event := mq.OrderEvent{
+		EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType: mq.EventOrderCancelled,
+		OrderID:   orderID,
+		UserID:    userID,
+		Symbol:    symbol,
+		Side:      side,
+		Price:     price,
+		Amount:    remaining,
+		Status:    "CANCELLED",
+		Timestamp: time.Now().UnixMilli(),
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		slog.Warn("marshal cancel event failed", "error", err)
+		return
+	}
+
+	tx := s.db.Begin()
+	if tx.Error != nil {
+		slog.Warn("begin tx failed", "error", tx.Error)
+		return
+	}
+	msg := &persistence.OutboxModel{
+		AggregateID: orderID,
+		Topic:       s.kafkaTopic,
+		Payload:     string(payload),
+		Status:      "PENDING",
+	}
+	if err := s.outboxRepo.Create(tx, msg); err != nil {
+		tx.Rollback()
+		slog.Warn("write cancel outbox failed", "error", err)
+		return
+	}
+	tx.Commit()
 }
