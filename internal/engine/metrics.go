@@ -6,13 +6,17 @@ import (
 	"time"
 )
 
-// Metrics 撮合耗时统计（滑窗 + 分位）
+// Metrics 撮合耗时统计（滑窗 + 分位 + TPS）
 type Metrics struct {
 	mu         sync.Mutex
 	latencies  []time.Duration // 最近 N 次撮合耗时
 	maxSamples int             // 滑窗大小
 	totalCount int64           // 累计撮合次数
 	totalTime  time.Duration   // 累计耗时
+
+	// TPS 统计
+	timestamps   []time.Time // 最近撮合的时间戳
+	tpsWindowSec int         // TPS 窗口（秒）
 }
 
 // NewMetrics 创建 metrics
@@ -22,8 +26,10 @@ func NewMetrics(maxSamples int) *Metrics {
 		maxSamples = 1000
 	}
 	return &Metrics{
-		latencies:  make([]time.Duration, 0, maxSamples),
-		maxSamples: maxSamples,
+		latencies:    make([]time.Duration, 0, maxSamples),
+		maxSamples:   maxSamples,
+		timestamps:   make([]time.Time, 0, 10000),
+		tpsWindowSec: 10, // 默认 10 秒窗口
 	}
 }
 
@@ -32,27 +38,56 @@ func (m *Metrics) Record(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now()
 	m.totalCount++
 	m.totalTime += d
 
-	// 滑窗：满了就丢最早的
+	// 滑窗
 	if len(m.latencies) >= m.maxSamples {
-		// 简单做法：移除第一个元素（切片头部删除 O(n)）
-		// 更好的做法是环形缓冲，但为了简单先用这个
 		m.latencies = m.latencies[1:]
 	}
 	m.latencies = append(m.latencies, d)
+
+	// TPS：记录时间戳 + 清理窗口外
+	m.timestamps = append(m.timestamps, now)
+	m.cleanupTimestamps(now)
 }
 
-// Snapshot 返回当前快照
+// cleanupTimestamps 清理 TPS 窗口外的时间戳（调用方必须持有锁）
+func (m *Metrics) cleanupTimestamps(now time.Time) {
+	if m.tpsWindowSec <= 0 {
+		return
+	}
+	cutoff := now.Add(-time.Duration(m.tpsWindowSec) * time.Second)
+
+	idx := 0
+	for i, t := range m.timestamps {
+		if t.After(cutoff) {
+			idx = i
+			break
+		}
+		idx = i + 1
+	}
+
+	if idx > 0 {
+		m.timestamps = m.timestamps[idx:]
+	}
+}
+
+// MetricsSnapshot 返回当前快照
 type MetricsSnapshot struct {
-	Count   int64   `json:"count"`   // 累计撮合次数
-	AvgMs   float64 `json:"avg_ms"`  // 平均耗时（毫秒）
-	P50Ms   float64 `json:"p50_ms"`  // P50
-	P95Ms   float64 `json:"p95_ms"`  // P95
-	P99Ms   float64 `json:"p99_ms"`  // P99
-	MaxMs   float64 `json:"max_ms"`  // 最大
-	Samples int     `json:"samples"` // 当前滑窗样本数
+	Count   int64   `json:"count"`
+	AvgMs   float64 `json:"avg_ms"`
+	P50Ms   float64 `json:"p50_ms"`
+	P95Ms   float64 `json:"p95_ms"`
+	P99Ms   float64 `json:"p99_ms"`
+	MaxMs   float64 `json:"max_ms"`
+	Samples int     `json:"samples"`
+
+	// 吞吐
+	TPS       float64 `json:"tps"`
+	TPSWindow int     `json:"tps_window_s"`
+	TPSRecent int     `json:"tps_recent"`
 }
 
 // Snapshot 返回统计快照
@@ -60,9 +95,18 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now()
+	m.cleanupTimestamps(now)
+
 	snap := MetricsSnapshot{
-		Count:   m.totalCount,
-		Samples: len(m.latencies),
+		Count:     m.totalCount,
+		Samples:   len(m.latencies),
+		TPSWindow: m.tpsWindowSec,
+		TPSRecent: len(m.timestamps),
+	}
+
+	if m.tpsWindowSec > 0 {
+		snap.TPS = float64(len(m.timestamps)) / float64(m.tpsWindowSec)
 	}
 
 	if m.totalCount > 0 {
@@ -73,7 +117,6 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		return snap
 	}
 
-	// 复制一份排序，不影响原数组
 	sorted := make([]time.Duration, len(m.latencies))
 	copy(sorted, m.latencies)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -89,8 +132,6 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 }
 
 // percentileMs 计算分位耗时（毫秒）
-// sorted 必须已排序
-// p: 0.5 / 0.95 / 0.99
 func percentileMs(sorted []time.Duration, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
