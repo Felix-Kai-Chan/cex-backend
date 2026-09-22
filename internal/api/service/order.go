@@ -440,6 +440,7 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 
 	outboxMsg := &persistence.OutboxModel{
 		AggregateID: order.ID,
+		KafkaKey:    req.Symbol, // ✅ 加上
 		Topic:       s.kafkaTopic,
 		Payload:     string(payload),
 		Status:      "PENDING",
@@ -572,6 +573,7 @@ func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, p
 	}
 	msg := &persistence.OutboxModel{
 		AggregateID: orderID,
+		KafkaKey:    symbol, // ✅ 加上
 		Topic:       s.kafkaTopic,
 		Payload:     string(payload),
 		Status:      "PENDING",

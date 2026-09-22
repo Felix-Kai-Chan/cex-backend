@@ -89,12 +89,13 @@ func processBatch(ctx context.Context, repo *persistence.OutboxRepo, producer *m
 
 	sentCount := 0
 	for _, msg := range msgs {
-		// 用 AggregateID 作为 Kafka key
-		err := producer.SendRaw(ctx, msg.AggregateID, []byte(msg.Payload))
+		// ✅ 用 KafkaKey（symbol）做分区 key，保证同一交易对消息进同一分区
+		err := producer.SendRaw(ctx, msg.KafkaKey, []byte(msg.Payload))
 		if err != nil {
 			slog.Warn("send failed",
 				"outbox_id", msg.ID,
 				"aggregate_id", msg.AggregateID,
+				"kafka_key", msg.KafkaKey,
 				"error", err,
 			)
 			_ = repo.MarkFailed(msg.ID, err.Error())

@@ -10,6 +10,7 @@ import (
 type OutboxModel struct {
 	ID          uint      `gorm:"primaryKey"`
 	AggregateID string    `gorm:"index;size:64"` // 关联的业务 ID（如 order_id）
+	KafkaKey    string    `gorm:"size:64"`       // ✅ Kafka 分区 key（symbol）
 	Topic       string    `gorm:"size:64"`       // Kafka topic
 	Payload     string    `gorm:"type:text"`     // 消息体（JSON）
 	Status      string    `gorm:"index;size:16"` // PENDING / SENT / FAILED
