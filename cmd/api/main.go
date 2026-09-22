@@ -85,6 +85,17 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
+	// ✅ 新增：监控指标接口
+	r.GET("/metrics", func(c *gin.Context) {
+		metricsSnap := eng.GetMetrics().Snapshot()
+		breakerStatus := eng.GetBreakerStatus()
+
+		c.JSON(200, gin.H{
+			"match_latency":    metricsSnap,
+			"circuit_breakers": breakerStatus,
+		})
+	})
+
 	r.GET("/ws", func(c *gin.Context) {
 		userID := c.Query("user_id")
 		if userID == "" {

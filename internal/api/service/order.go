@@ -87,7 +87,19 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("amount 必须大于 0")
 	}
 
-	// 2. 订单类型校验
+	// ✅ 2. 熔断检查（新增）
+	breaker := s.eng.GetBreaker(req.Symbol)
+	if breaker.IsOpen() {
+		_, remainSec, lastPrice := breaker.Status()
+		slog.Warn("circuit breaker open, reject order",
+			"symbol", req.Symbol,
+			"remain_sec", remainSec,
+			"last_price", lastPrice,
+		)
+		return nil, fmt.Errorf("交易对 %s 因价格波动过大已熔断，剩余 %d 秒", req.Symbol, remainSec)
+	}
+
+	// 3. 订单类型校验
 	if req.OrderType == "" {
 		req.OrderType = "LIMIT"
 	}
@@ -105,7 +117,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("order_type 必须是 LIMIT / MARKET / IOC / FOK")
 	}
 
-	// 3. 价格校验
+	// 4. 价格校验
 	if orderType == engine.TypeMarket {
 		if req.Price != 0 {
 			req.Price = 0
@@ -131,7 +143,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	baseAsset := getBaseAsset(req.Symbol)
 	quoteAsset := getQuoteAsset(req.Symbol)
 
-	// 4. 冻结
+	// 5. 冻结
 	var freezeAmount float64
 	var freezeAsset string
 
@@ -159,7 +171,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("冻结余额失败: %w", err)
 	}
 
-	// 5. 创建订单
+	// 6. 创建订单
 	order := &engine.Order{
 		ID:        fmt.Sprintf("%s_%d", req.UserID, time.Now().UnixNano()),
 		UserID:    req.UserID,
@@ -173,11 +185,19 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 
 	_ = s.repo.SaveOrder(order.ID, order.UserID, req.Symbol, req.Side, order.Price, order.Amount, order.Remaining, "PENDING")
 
-	// 6. 撮合
+	// ✅ 7. 撮合（新增：记耗时）
 	ob := s.eng.GetOrderBook(req.Symbol)
+	matchStart := time.Now()
 	trades, changes := ob.Match(order)
+	matchDuration := time.Since(matchStart)
 
-	// 7. 写 WAL
+	// ✅ 8. 记 metrics + 更新熔断器（新增）
+	s.eng.GetMetrics().Record(matchDuration)
+	for _, trade := range trades {
+		breaker.UpdatePrice(trade.Price)
+	}
+
+	// 9. 写 WAL
 	if snapshotter := s.eng.GetSnapshotter(req.Symbol); snapshotter != nil {
 		var walEntries []engine.WALEntry
 		for _, ch := range changes {
@@ -203,9 +223,10 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		"order_type", req.OrderType,
 		"trades", len(trades),
 		"remaining", order.Remaining,
+		"match_us", matchDuration.Microseconds(), // ✅ 新增
 	)
 
-	// 8. 处理成交
+	// 10. 处理成交
 	var tradeResponses []TradeResponse
 	for _, trade := range trades {
 		tradeResponses = append(tradeResponses, TradeResponse{
@@ -267,20 +288,18 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		)
 	}
 
-	// 9. ✅ 更新当前订单状态（修正：IOC / FOK 优先于 PARTIAL）
+	// 11. 更新当前订单状态
 	status := "PENDING"
 	if order.Remaining == 0 {
 		status = "FILLED"
 	} else if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
-		// IOC / FOK 只要未全部成交，剩余部分不挂单，等同取消
 		status = "CANCELLED"
 	} else if order.Remaining < order.Amount {
-		// LIMIT / MARKET 部分成交，剩余挂单
 		status = "PARTIAL"
 	}
 	_ = s.repo.UpdateOrder(order.ID, order.Remaining, status)
 
-	// 10. ✅ 解冻未成交部分
+	// 12. 解冻未成交部分
 	if order.Remaining > 0 {
 		shouldUnfreeze := false
 		if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
@@ -289,8 +308,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			shouldUnfreeze = true
 		} else if orderType == engine.TypeLimit && order.Remaining < order.Amount {
 			shouldUnfreeze = true
-			// ⚠️ 注意：LIMIT 部分成交的剩余部分挂在订单簿，冻结应该保留
-			// 但原代码逻辑是解冻剩余部分，为了不破坏现有逻辑，先保持不变
 		}
 
 		if shouldUnfreeze {
