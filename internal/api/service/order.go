@@ -38,9 +38,9 @@ type OrderService struct {
 	ledger      *persistence.LedgerRepo
 	hub         *websocket.Hub
 	balanceRepo *persistence.BalanceRepo
-	db          *gorm.DB                // ✅ 新增：事务用
-	outboxRepo  *persistence.OutboxRepo // ✅ 新增：写 outbox
-	kafkaTopic  string                  // ✅ 新增：Kafka topic
+	db          *gorm.DB
+	outboxRepo  *persistence.OutboxRepo
+	kafkaTopic  string
 }
 
 func NewOrderService(
@@ -157,10 +157,56 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		price = req.Price
 	}
 
+	// ✅ 5. 市价单保护（新增）
+	if orderType == engine.TypeMarket {
+		// 5.1 数量上限
+		if err := breaker.CheckMarketAmount(req.Amount); err != nil {
+			slog.Warn("market order rejected by amount check",
+				"symbol", req.Symbol,
+				"amount", req.Amount,
+				"error", err,
+			)
+			return nil, err
+		}
+
+		// 5.2 滑点保护
+		ob := s.eng.GetOrderBook(req.Symbol)
+		var refPrice int64
+		if side == engine.Buy {
+			refPrice = ob.BestAsk()
+		} else {
+			refPrice = ob.BestBid()
+		}
+
+		if refPrice > 0 {
+			tempOrder := &engine.Order{
+				ID:        "estimate",
+				UserID:    req.UserID,
+				Side:      side,
+				Type:      engine.TypeMarket,
+				Price:     0,
+				Amount:    req.Amount,
+				Remaining: req.Amount,
+			}
+			estAvg, _ := ob.EstimateMatchAvgPrice(tempOrder)
+			if estAvg > 0 {
+				if err := breaker.CheckSlippage(side, refPrice, estAvg); err != nil {
+					slog.Warn("market order rejected by slippage check",
+						"symbol", req.Symbol,
+						"ref_price", refPrice,
+						"est_avg", estAvg,
+						"error", err,
+					)
+					return nil, err
+				}
+			}
+		}
+	}
+
 	baseAsset := getBaseAsset(req.Symbol)
 	quoteAsset := getQuoteAsset(req.Symbol)
 
-	// 5. 冻结
+	// 6. 冻结
 	var freezeAmount float64
 	var freezeAsset string
 
@@ -188,7 +234,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("冻结余额失败: %w", err)
 	}
 
-	// 6. 创建订单
+	// 7. 创建订单
 	order := &engine.Order{
 		ID:        fmt.Sprintf("%s_%d", req.UserID, time.Now().UnixNano()),
 		UserID:    req.UserID,
@@ -200,26 +246,25 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		Timestamp: time.Now().UnixMilli(),
 	}
 
-	// ✅ 6.1 同事务写 order + outbox
+	// 7.1 同事务写 order + outbox
 	if err := s.saveOrderWithOutbox(order, req); err != nil {
-		// 回滚：解冻
 		_ = s.balanceRepo.UnfreezeBalance(req.UserID, freezeAsset, freezeAmount)
 		return nil, fmt.Errorf("订单创建失败: %w", err)
 	}
 
-	// 7. 撮合（记耗时）
+	// 8. 撮合
 	ob := s.eng.GetOrderBook(req.Symbol)
 	matchStart := time.Now()
 	trades, changes := ob.Match(order)
 	matchDuration := time.Since(matchStart)
 
-	// 8. 记 metrics + 更新熔断器
+	// 9. 记 metrics + 更新熔断器
 	s.eng.GetMetrics().Record(matchDuration)
 	for _, trade := range trades {
 		breaker.UpdatePrice(trade.Price)
 	}
 
-	// 9. 写 WAL
+	// 10. 写 WAL
 	if snapshotter := s.eng.GetSnapshotter(req.Symbol); snapshotter != nil {
 		var walEntries []engine.WALEntry
 		for _, ch := range changes {
@@ -248,7 +293,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		"match_us", matchDuration.Microseconds(),
 	)
 
-	// 10. 处理成交
+	// 11. 处理成交
 	var tradeResponses []TradeResponse
 	for _, trade := range trades {
 		tradeResponses = append(tradeResponses, TradeResponse{
@@ -310,7 +355,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		)
 	}
 
-	// 11. 更新当前订单状态
+	// 12. 更新当前订单状态
 	status := "PENDING"
 	if order.Remaining == 0 {
 		status = "FILLED"
@@ -321,7 +366,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}
 	_ = s.repo.UpdateOrder(order.ID, order.Remaining, status)
 
-	// 12. 解冻未成交部分
+	// 13. 解冻未成交部分
 	if order.Remaining > 0 {
 		shouldUnfreeze := false
 		if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
@@ -358,7 +403,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}, nil
 }
 
-// saveOrderWithOutbox 同事务写 order + outbox
 func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrderRequest) error {
 	tx := s.db.Begin()
 	if tx.Error != nil {
@@ -371,13 +415,11 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 		}
 	}()
 
-	// 1. 写 order
 	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, order.Price, order.Amount, order.Remaining, "PENDING"); err != nil {
 		tx.Rollback()
 		return err
 	}
 
-	// 2. 构造 outbox 消息
 	event := mq.OrderEvent{
 		EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
 		EventType: mq.EventOrderCreated,
@@ -452,7 +494,6 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		return err
 	}
 
-	// 写 WAL
 	if snapshotter := s.eng.GetSnapshotter(symbol); snapshotter != nil {
 		_ = snapshotter.AppendWAL(engine.WALEntry{
 			Op:        "REMOVE",
@@ -465,7 +506,6 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		})
 	}
 
-	// ✅ 写 outbox（撤单事件）
 	go s.writeCancelOutbox(orderID, userID, symbol, order.Side, order.Price, order.Remaining)
 
 	baseAsset := getBaseAsset(symbol)
@@ -506,7 +546,6 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	return nil
 }
 
-// writeCancelOutbox 写撤单事件到 outbox（异步，best effort）
 func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, price, remaining int64) {
 	event := mq.OrderEvent{
 		EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),

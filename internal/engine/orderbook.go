@@ -60,7 +60,7 @@ type OrderBook struct {
 	asks      map[int64]*OrderList
 	bidPrices *SkipList
 	askPrices *SkipList
-	orders    map[string]*Order // ✅ OrderID → Order 节点索引，撤单 O(1)
+	orders    map[string]*Order
 	mu        sync.RWMutex
 }
 
@@ -109,7 +109,6 @@ func (ob *OrderBook) addOrderLocked(order *Order) {
 		list.Tail = order
 	}
 
-	// ✅ 写索引
 	ob.orders[order.ID] = order
 }
 
@@ -145,7 +144,6 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 	var trades []Trade
 	var changes []OrderChange
 
-	// FOK 预检查
 	if order.Type == TypeFOK {
 		if !ob.canFillCompletely(order) {
 			return trades, changes
@@ -205,7 +203,6 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 		order.Remaining -= qty
 		matchOrder.Remaining -= qty
 
-		// 对手单被吃完 → 从订单簿移除 + 记录 REMOVE
 		if matchOrder.Remaining == 0 {
 			matchList.Head = matchOrder.Next
 			if matchList.Head == nil {
@@ -220,7 +217,6 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 			}
 			matchOrder.Next = nil
 
-			// ✅ 删索引
 			delete(ob.orders, matchOrder.ID)
 
 			changes = append(changes, OrderChange{
@@ -235,7 +231,6 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 		}
 	}
 
-	// 当前订单还有剩余 → 判断是否挂单
 	if order.Remaining > 0 {
 		if order.Type != TypeIOC && order.Type != TypeFOK {
 			ob.addOrderLocked(order)
@@ -295,7 +290,75 @@ func (ob *OrderBook) canFillCompletely(order *Order) bool {
 	return need <= 0
 }
 
-// getLowestAsk 获取最低卖价（跳表头节点）
+// EstimateMatchAvgPrice 模拟吃单，返回预估成交均价（不修改订单簿）
+// 返回 (均价, 是否能吃满)
+func (ob *OrderBook) EstimateMatchAvgPrice(order *Order) (int64, bool) {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+
+	need := order.Remaining
+	totalValue := int64(0)
+	filled := int64(0)
+
+	if order.Side == Buy {
+		for _, node := range ob.askPrices.GetAll() {
+			if order.Price != 0 && node.Price > order.Price {
+				break
+			}
+			list := node.List
+			if list == nil || list.Head == nil {
+				continue
+			}
+			for o := list.Head; o != nil; o = o.Next {
+				take := o.Remaining
+				if take > need {
+					take = need
+				}
+				totalValue += node.Price * take
+				filled += take
+				need -= take
+				if need == 0 {
+					break
+				}
+			}
+			if need == 0 {
+				break
+			}
+		}
+	} else {
+		for _, node := range ob.bidPrices.GetAll() {
+			if order.Price != 0 && node.Price < order.Price {
+				break
+			}
+			list := node.List
+			if list == nil || list.Head == nil {
+				continue
+			}
+			for o := list.Head; o != nil; o = o.Next {
+				take := o.Remaining
+				if take > need {
+					take = need
+				}
+				totalValue += node.Price * take
+				filled += take
+				need -= take
+				if need == 0 {
+					break
+				}
+			}
+			if need == 0 {
+				break
+			}
+		}
+	}
+
+	if filled == 0 {
+		return 0, false
+	}
+	return totalValue / filled, filled == order.Remaining
+}
+
+// getLowestAsk 获取最低卖价
 func (ob *OrderBook) getLowestAsk() (int64, *OrderList) {
 	node := ob.askPrices.First()
 	if node == nil || node.List == nil || node.List.Head == nil {
@@ -304,7 +367,7 @@ func (ob *OrderBook) getLowestAsk() (int64, *OrderList) {
 	return node.Price, node.List
 }
 
-// getHighestBid 获取最高买价（跳表头节点）
+// getHighestBid 获取最高买价
 func (ob *OrderBook) getHighestBid() (int64, *OrderList) {
 	node := ob.bidPrices.First()
 	if node == nil || node.List == nil || node.List.Head == nil {
@@ -313,18 +376,16 @@ func (ob *OrderBook) getHighestBid() (int64, *OrderList) {
 	return node.Price, node.List
 }
 
-// CancelOrder 从订单簿中移除订单（✅ O(1) 索引定位）
+// CancelOrder 从订单簿中移除订单（O(1) 索引定位）
 func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	// ✅ O(1) 从索引查
 	order, ok := ob.orders[orderID]
 	if !ok {
 		return nil, fmt.Errorf("订单不在订单簿中")
 	}
 
-	// 根据 side 找到对应的价格档
 	var list *OrderList
 	if order.Side == Buy {
 		list = ob.bids[order.Price]
@@ -333,20 +394,16 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 	}
 
 	if list == nil || list.Head == nil {
-		// 索引有但链表空，说明数据不一致，清理索引
 		delete(ob.orders, orderID)
 		return nil, fmt.Errorf("订单不在订单簿中")
 	}
 
-	// 从链表摘掉
 	removed := ob.removeFromList(list, orderID)
 	if removed == nil {
-		// 链表里没找到，清索引
 		delete(ob.orders, orderID)
 		return nil, fmt.Errorf("订单不在订单簿中")
 	}
 
-	// 价格档空了 → 从 map + 跳表删
 	if list.Head == nil {
 		if order.Side == Buy {
 			delete(ob.bids, order.Price)
@@ -357,7 +414,6 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 		}
 	}
 
-	// ✅ 删索引
 	delete(ob.orders, orderID)
 
 	return removed, nil
