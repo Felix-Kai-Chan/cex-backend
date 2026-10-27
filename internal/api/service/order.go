@@ -428,16 +428,21 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 
 			// 成交事件 Outbox
 			event := mq.OrderEvent{
-				EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-				EventType: mq.EventTradeFilled,
-				OrderID:   trade.BuyOrder,
-				UserID:    trade.BuyUserID,
-				Symbol:    req.Symbol,
-				Side:      "BUY",
-				Price:     trade.Price,
-				Amount:    trade.Quantity,
-				Status:    "FILLED",
-				Timestamp: trade.Timestamp,
+				EventID:     fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+				EventType:   mq.EventTradeFilled,
+				OrderID:     trade.BuyOrder,
+				UserID:      trade.BuyUserID,
+				Symbol:      req.Symbol,
+				Side:        "BUY",
+				TradeID:     trade.TradeID,
+				BuyOrder:    trade.BuyOrder,
+				SellOrder:   trade.SellOrder,
+				BuyUserID:   trade.BuyUserID,
+				SellUserID:  trade.SellUserID,
+				Price:       trade.Price,
+				Amount:      trade.Quantity,
+				Status:      "FILLED",
+				Timestamp:   trade.Timestamp,
 			}
 			payload, _ := json.Marshal(event)
 			outboxMsg := &persistence.OutboxModel{

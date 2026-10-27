@@ -11,6 +11,11 @@ type OrderEvent struct {
 	OrderType   string `json:"order_type,omitempty"`
 	TimeInForce string `json:"time_in_force,omitempty"`
 	ExpireAt    int64  `json:"expire_at,omitempty"`
+	TradeID     string `json:"trade_id,omitempty"`
+	BuyOrder    string `json:"buy_order,omitempty"`
+	SellOrder   string `json:"sell_order,omitempty"`
+	BuyUserID   string `json:"buy_user_id,omitempty"`
+	SellUserID  string `json:"sell_user_id,omitempty"`
 	Price       int64  `json:"price"`
 	Amount      int64  `json:"amount"`
 	Status      string `json:"status"`

@@ -34,7 +34,8 @@ func InitDB(dsn string) (*gorm.DB, error) {
 		&TradeModel{},
 		&BalanceModel{},
 		&LedgerModel{},
-		&OutboxModel{}, // ✅ 新增
+		&OutboxModel{},        // ✅ 新增
+		&ConsumedEventModel{}, // ✅ 消费者幂等去重
 	); err != nil {
 		return nil, err
 	}
