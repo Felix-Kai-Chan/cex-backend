@@ -2,6 +2,7 @@ package test
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,12 +15,18 @@ import (
 )
 
 func setupTestDB(t *testing.T) *gorm.DB {
-	dsn := "root:@tcp(127.0.0.1:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := os.Getenv("TEST_MYSQL_DSN")
+	if dsn == "" {
+		dsn = "root:root@tcp(127.0.0.1:13306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
+	}
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent), // ✅ 关闭 SQL 日志，避免 connection reset 刷屏
 	})
 	if err != nil {
 		t.Fatalf("MySQL 连接失败: %v", err)
+	}
+	if err := db.AutoMigrate(&persistence.BalanceModel{}); err != nil {
+		t.Fatalf("建表失败: %v", err)
 	}
 	// ✅ 调大连接池
 	sqlDB, _ := db.DB()
