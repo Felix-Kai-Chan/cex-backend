@@ -56,54 +56,54 @@ echo -e "${YELLOW}========================================${NC}"
 # ---------- 1. IOC 部分成交：解冻未成交部分 ----------
 echo -e "\n${YELLOW}--- Test 1: IOC 部分成交 ---${NC}"
 add_balance seller BTC 10
-add_balance buyer USDT 1000
+add_balance buyer USDT 500000
 
 # 卖方挂 3 BTC @100
-place_order seller SELL LIMIT 100 3 >/dev/null
+place_order seller SELL LIMIT 50000 3 >/dev/null
 
-# IOC 买单 5 BTC @100：应成交 3，取消 2，解冻 200 USDT
-place_order buyer BUY LIMIT 100 5 IOC >/dev/null
+# IOC 买单 5 BTC @100：应成交 3，取消 2，解冻 100000 USDT
+place_order buyer BUY LIMIT 50000 5 IOC >/dev/null
 
 B_AVAIL=$(avail buyer USDT)
 B_FROZEN=$(frozen buyer USDT)
 B_BTC=$(avail buyer BTC)
 echo "buyer USDT available=$B_AVAIL frozen=$B_FROZEN BTC=$B_BTC"
-assert_eq "$B_AVAIL" "700" "IOC 部分成交后 USDT available 应为 700"
+assert_eq "$B_AVAIL" "350000" "IOC 部分成交后 USDT available 应为 700"
 assert_eq "$B_FROZEN" "0" "IOC 部分成交后 USDT frozen 应为 0"
 assert_eq "$B_BTC" "3" "IOC 应成交 3 BTC"
 
 # ---------- 2. FOK 无法完全成交：全部解冻 ----------
 echo -e "\n${YELLOW}--- Test 2: FOK 失败（流动性不足）---${NC}"
 add_balance seller2 BTC 10
-add_balance buyer2 USDT 1000
+add_balance buyer2 USDT 500000
 
-place_order seller2 SELL LIMIT 100 3 >/dev/null
+place_order seller2 SELL LIMIT 50000 3 >/dev/null
 
-# FOK 买单 5 BTC @100：无法完全成交，整单取消，解冻 500 USDT
-place_order buyer2 BUY LIMIT 100 5 FOK >/dev/null
+# FOK 买单 5 BTC @100：无法完全成交，整单取消，解冻 250000 USDT
+place_order buyer2 BUY LIMIT 50000 5 FOK >/dev/null
 
 B2_AVAIL=$(avail buyer2 USDT)
 B2_FROZEN=$(frozen buyer2 USDT)
 B2_BTC=$(avail buyer2 BTC)
 echo "buyer2 USDT available=$B2_AVAIL frozen=$B2_FROZEN BTC=$B2_BTC"
-assert_eq "$B2_AVAIL" "1000" "FOK 失败后 USDT 应全额解冻"
+assert_eq "$B2_AVAIL" "500000" "FOK 失败后 USDT 应全额解冻"
 assert_eq "$B2_FROZEN" "0" "FOK 失败后 frozen 应为 0"
 assert_eq "$B2_BTC" "0" "FOK 失败不应成交"
 
 # ---------- 3. FOK 完全成交：无残余解冻 ----------
 echo -e "\n${YELLOW}--- Test 3: FOK 成功（流动性充足）---${NC}"
 add_balance seller3 BTC 10
-add_balance buyer3 USDT 1000
+add_balance buyer3 USDT 500000
 
-place_order seller3 SELL LIMIT 100 5 >/dev/null
+place_order seller3 SELL LIMIT 50000 5 >/dev/null
 
-place_order buyer3 BUY LIMIT 100 5 FOK >/dev/null
+place_order buyer3 BUY LIMIT 50000 5 FOK >/dev/null
 
 B3_AVAIL=$(avail buyer3 USDT)
 B3_FROZEN=$(frozen buyer3 USDT)
 B3_BTC=$(avail buyer3 BTC)
 echo "buyer3 USDT available=$B3_AVAIL frozen=$B3_FROZEN BTC=$B3_BTC"
-assert_eq "$B3_AVAIL" "500" "FOK 成功后 USDT available 应为 500"
+assert_eq "$B3_AVAIL" "250000" "FOK 成功后 USDT available 应为 500"
 assert_eq "$B3_FROZEN" "0" "FOK 成功后 frozen 应为 0"
 assert_eq "$B3_BTC" "5" "FOK 应成交 5 BTC"
 
