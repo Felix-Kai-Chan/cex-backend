@@ -20,9 +20,43 @@ type OrderType string
 const (
 	TypeLimit  OrderType = "LIMIT"
 	TypeMarket OrderType = "MARKET"
-	TypeIOC    OrderType = "IOC"
-	TypeFOK    OrderType = "FOK"
+
+	// Deprecated: 兼容旧代码/旧数据，新逻辑请使用 TimeInForce
+	TypeIOC OrderType = "IOC"
+	TypeFOK OrderType = "FOK"
 )
+
+// TimeInForce 时间策略
+type TimeInForce string
+
+const (
+	TIFGTC TimeInForce = "GTC"
+	TIFIOC TimeInForce = "IOC"
+	TIFFOK TimeInForce = "FOK"
+	TIFGTD TimeInForce = "GTD"
+)
+
+// normalizeTIF 兼容推断：旧数据/零值 → 新 TIF
+func normalizeTIF(order *Order) {
+	if order == nil {
+		return
+	}
+	if order.TIF == "" {
+		if order.Type == TypeMarket {
+			order.TIF = TIFIOC
+		} else {
+			order.TIF = TIFGTC
+		}
+	}
+	if order.Type == TypeIOC {
+		order.Type = TypeLimit
+		order.TIF = TIFIOC
+	}
+	if order.Type == TypeFOK {
+		order.Type = TypeLimit
+		order.TIF = TIFFOK
+	}
+}
 
 // Order 订单结构体
 type Order struct {
@@ -30,6 +64,8 @@ type Order struct {
 	UserID    string
 	Side      Side
 	Type      OrderType
+	TIF       TimeInForce
+	ExpireAt  int64
 	Price     int64
 	Amount    int64
 	Remaining int64
@@ -50,6 +86,8 @@ type OrderChange struct {
 	UserID    string
 	Side      string
 	Type      OrderType
+	TIF       TimeInForce
+	ExpireAt  int64
 	Price     int64
 	Amount    int64
 	Remaining int64
@@ -143,6 +181,8 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
+	normalizeTIF(order)
+
 	var trades []Trade
 	var changes []OrderChange
 	rollback := RollbackData{
@@ -151,10 +191,15 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 		PartialMakers: make(map[string]int64),
 	}
 
-	if order.Type == TypeFOK {
+	if order.TIF == TIFFOK {
 		if !ob.canFillCompletely(order) {
 			return trades, changes, rollback
 		}
+	}
+
+	// GTD 过期：直接不成交
+	if order.TIF == TIFGTD && order.ExpireAt > 0 && time.Now().UnixMilli() > order.ExpireAt {
+		return trades, changes, rollback
 	}
 
 	for order.Remaining > 0 {
@@ -184,6 +229,37 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 		}
 
 		matchOrder := matchList.Head
+
+		// GTD 过期挂单：摘除并继续（TODO: 上层需同步 DB 状态/解冻）
+		if matchOrder.TIF == TIFGTD && matchOrder.ExpireAt > 0 && time.Now().UnixMilli() > matchOrder.ExpireAt {
+			matchList.Head = matchOrder.Next
+			if matchList.Head == nil {
+				matchList.Tail = nil
+				if order.Side == Buy {
+					delete(ob.asks, matchPrice)
+					ob.askPrices.Remove(matchPrice)
+				} else {
+					delete(ob.bids, matchPrice)
+					ob.bidPrices.Remove(matchPrice)
+				}
+			}
+			matchOrder.Next = nil
+			delete(ob.orders, matchOrder.ID)
+			changes = append(changes, OrderChange{
+				Op:        "REMOVE",
+				OrderID:   matchOrder.ID,
+				UserID:    matchOrder.UserID,
+				Side:      string(matchOrder.Side),
+				Type:      matchOrder.Type,
+				TIF:       matchOrder.TIF,
+				ExpireAt:  matchOrder.ExpireAt,
+				Price:     matchOrder.Price,
+				Remaining: 0,
+				Timestamp: time.Now().UnixMilli(),
+			})
+			continue
+		}
+
 		qty := min(order.Remaining, matchOrder.Remaining)
 
 		prevMakerRemaining := matchOrder.Remaining
@@ -254,7 +330,11 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 	}
 
 	if order.Remaining > 0 {
-		if order.Type != TypeIOC && order.Type != TypeFOK {
+		canRest := order.Type == TypeLimit &&
+			(order.TIF == TIFGTC || order.TIF == TIFGTD) &&
+			!(order.TIF == TIFGTD && order.ExpireAt > 0 && time.Now().UnixMilli() > order.ExpireAt)
+
+		if canRest {
 			ob.addOrderLocked(order)
 			changes = append(changes, OrderChange{
 				Op:        "ADD",
@@ -262,6 +342,8 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 				UserID:    order.UserID,
 				Side:      string(order.Side),
 				Type:      order.Type,
+				TIF:       order.TIF,
+				ExpireAt:  order.ExpireAt,
 				Price:     order.Price,
 				Amount:    order.Amount,
 				Remaining: order.Remaining,
@@ -288,6 +370,9 @@ func (ob *OrderBook) canFillCompletely(order *Order) bool {
 				continue
 			}
 			for o := list.Head; o != nil; o = o.Next {
+				if o.TIF == TIFGTD && o.ExpireAt > 0 && time.Now().UnixMilli() > o.ExpireAt {
+					continue
+				}
 				need -= o.Remaining
 				if need <= 0 {
 					return true
@@ -304,6 +389,9 @@ func (ob *OrderBook) canFillCompletely(order *Order) bool {
 				continue
 			}
 			for o := list.Head; o != nil; o = o.Next {
+				if o.TIF == TIFGTD && o.ExpireAt > 0 && time.Now().UnixMilli() > o.ExpireAt {
+					continue
+				}
 				need -= o.Remaining
 				if need <= 0 {
 					return true
@@ -335,6 +423,9 @@ func (ob *OrderBook) EstimateMatchAvgPrice(order *Order) (int64, bool) {
 				continue
 			}
 			for o := list.Head; o != nil; o = o.Next {
+				if o.TIF == TIFGTD && o.ExpireAt > 0 && time.Now().UnixMilli() > o.ExpireAt {
+					continue
+				}
 				take := o.Remaining
 				if take > need {
 					take = need

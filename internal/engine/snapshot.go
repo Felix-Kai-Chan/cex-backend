@@ -13,16 +13,18 @@ import (
 
 // WALEntry WAL 操作日志条目
 type WALEntry struct {
-	Op        string    `json:"op"`
-	OrderID   string    `json:"order_id"`
-	UserID    string    `json:"user_id"`
-	Side      string    `json:"side"`
-	Type      OrderType `json:"type,omitempty"`
-	Price     int64     `json:"price"`
-	Amount    int64     `json:"amount,omitempty"`
-	Remaining int64     `json:"remaining"`
-	Timestamp int64     `json:"timestamp"`
-	TradeID   string    `json:"trade_id,omitempty"`
+	Op        string      `json:"op"`
+	OrderID   string      `json:"order_id"`
+	UserID    string      `json:"user_id"`
+	Side      string      `json:"side"`
+	Type      OrderType   `json:"type,omitempty"`
+	TIF       TimeInForce `json:"tif,omitempty"`
+	Price     int64       `json:"price"`
+	Amount    int64       `json:"amount,omitempty"`
+	Remaining int64       `json:"remaining"`
+	ExpireAt  int64       `json:"expire_at,omitempty"`
+	Timestamp int64       `json:"timestamp"`
+	TradeID   string      `json:"trade_id,omitempty"`
 }
 
 // Snapshot 快照结构
@@ -34,11 +36,15 @@ type Snapshot struct {
 
 // OrderItem 快照用的订单精简结构
 type OrderItem struct {
-	ID        string `json:"id"`
-	UserID    string `json:"user_id"`
-	Price     int64  `json:"price"`
-	Remaining int64  `json:"remaining"`
-	Timestamp int64  `json:"timestamp"`
+	ID        string      `json:"id"`
+	UserID    string      `json:"user_id"`
+	Type      OrderType   `json:"type,omitempty"`
+	TIF       TimeInForce `json:"tif,omitempty"`
+	Price     int64       `json:"price"`
+	Amount    int64       `json:"amount,omitempty"`
+	Remaining int64       `json:"remaining"`
+	ExpireAt  int64       `json:"expire_at,omitempty"`
+	Timestamp int64       `json:"timestamp"`
 }
 
 // Snapshotter 快照管理
@@ -176,15 +182,27 @@ func (s *Snapshotter) ReplayWAL() error {
 			if entry.Side == "SELL" {
 				side = Sell
 			}
+			orderType := entry.Type
+			if orderType == "" {
+				orderType = TypeLimit
+			}
+			amount := entry.Amount
+			if amount == 0 {
+				amount = entry.Remaining
+			}
 			order := &Order{
 				ID:        entry.OrderID,
 				UserID:    entry.UserID,
 				Side:      side,
+				Type:      orderType,
+				TIF:       entry.TIF,
 				Price:     entry.Price,
-				Amount:    entry.Remaining,
+				Amount:    amount,
 				Remaining: entry.Remaining,
+				ExpireAt:  entry.ExpireAt,
 				Timestamp: entry.Timestamp,
 			}
+			normalizeTIF(order)
 			s.addOrderLocked(order)
 			replayedCount++
 
@@ -244,11 +262,13 @@ func (s *Snapshotter) rebuildFromDB() error {
 			ID:        o.OrderID,
 			UserID:    o.UserID,
 			Side:      side,
+			Type:      TypeLimit,
 			Price:     o.Price,
 			Amount:    o.Remaining,
 			Remaining: o.Remaining,
 			Timestamp: o.CreatedAt.UnixMilli(),
 		}
+		normalizeTIF(order)
 		s.addOrderLocked(order)
 	}
 
@@ -485,8 +505,12 @@ func (s *Snapshotter) convertOrderBook(orders map[int64]*OrderList) map[int64][]
 				items = append(items, OrderItem{
 					ID:        order.ID,
 					UserID:    order.UserID,
+					Type:      order.Type,
+					TIF:       order.TIF,
 					Price:     order.Price,
+					Amount:    order.Amount,
 					Remaining: order.Remaining,
+					ExpireAt:  order.ExpireAt,
 					Timestamp: order.Timestamp,
 				})
 			}
@@ -511,10 +535,20 @@ func (s *Snapshotter) restoreOrderBook(items map[int64][]OrderItem, side Side) m
 				ID:        item.ID,
 				UserID:    item.UserID,
 				Side:      side,
+				Type:      item.Type,
+				TIF:       item.TIF,
 				Price:     item.Price,
-				Amount:    item.Remaining,
+				Amount:    item.Amount,
 				Remaining: item.Remaining,
+				ExpireAt:  item.ExpireAt,
 				Timestamp: item.Timestamp,
+			}
+			normalizeTIF(order)
+			if order.Amount == 0 {
+				order.Amount = order.Remaining
+			}
+			if order.Type == "" {
+				order.Type = TypeLimit
 			}
 
 			if list.Head == nil {
