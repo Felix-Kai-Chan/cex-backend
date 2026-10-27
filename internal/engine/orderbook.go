@@ -137,16 +137,21 @@ func (ob *OrderBook) BestAsk() int64 {
 }
 
 // Match 撮合（支持 LIMIT / MARKET / IOC / FOK）
-func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
+func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
 	var trades []Trade
 	var changes []OrderChange
+	rollback := RollbackData{
+		AddedOrderIDs: []string{},
+		RemovedMakers: []Order{},
+		PartialMakers: make(map[string]int64),
+	}
 
 	if order.Type == TypeFOK {
 		if !ob.canFillCompletely(order) {
-			return trades, changes
+			return trades, changes, rollback
 		}
 	}
 
@@ -178,6 +183,8 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 
 		matchOrder := matchList.Head
 		qty := min(order.Remaining, matchOrder.Remaining)
+
+		prevMakerRemaining := matchOrder.Remaining
 
 		trade := Trade{
 			TradeID:   fmt.Sprintf("trade_%d", time.Now().UnixNano()),
@@ -219,6 +226,12 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 
 			delete(ob.orders, matchOrder.ID)
 
+			removedMaker := *matchOrder
+			removedMaker.Remaining = prevMakerRemaining
+			removedMaker.Next = nil
+			rollback.RemovedMakers = append(rollback.RemovedMakers, removedMaker)
+			delete(rollback.PartialMakers, matchOrder.ID)
+
 			changes = append(changes, OrderChange{
 				Op:        "REMOVE",
 				OrderID:   matchOrder.ID,
@@ -228,6 +241,10 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 				Remaining: 0,
 				Timestamp: time.Now().UnixMilli(),
 			})
+		} else {
+			if _, ok := rollback.PartialMakers[matchOrder.ID]; !ok {
+				rollback.PartialMakers[matchOrder.ID] = prevMakerRemaining
+			}
 		}
 	}
 
@@ -243,10 +260,11 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange) {
 				Remaining: order.Remaining,
 				Timestamp: order.Timestamp,
 			})
+			rollback.AddedOrderIDs = append(rollback.AddedOrderIDs, order.ID)
 		}
 	}
 
-	return trades, changes
+	return trades, changes, rollback
 }
 
 // canFillCompletely 检查对手盘能否完全满足 order（FOK 用）

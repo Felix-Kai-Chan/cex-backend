@@ -268,7 +268,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	// 8. 撮合
 	ob := s.eng.GetOrderBook(req.Symbol)
 	matchStart := time.Now()
-	trades, changes := ob.Match(order)
+	trades, changes, _ := ob.Match(order)
 	matchDuration := time.Since(matchStart)
 
 	// 9. 记 metrics + 更新熔断器
