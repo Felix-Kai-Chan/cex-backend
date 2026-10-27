@@ -11,6 +11,8 @@ import (
 
 	"cex-backend/internal/mq"
 	"cex-backend/internal/persistence"
+
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -77,42 +79,45 @@ func main() {
 	}
 }
 
-// processBatch 拉一批待发消息，逐条发 Kafka
+// processBatch 在事务内拉取、发送并更新状态
 func processBatch(ctx context.Context, repo *persistence.OutboxRepo, producer *mq.KafkaProducer, limit int) error {
-	msgs, err := repo.FetchPending(limit)
-	if err != nil {
-		return err
-	}
-	if len(msgs) == 0 {
-		return nil
-	}
-
-	sentCount := 0
-	for _, msg := range msgs {
-		// ✅ 用 KafkaKey（symbol）做分区 key，保证同一交易对消息进同一分区
-		err := producer.SendRaw(ctx, msg.KafkaKey, []byte(msg.Payload))
+	return repo.Transaction(func(tx *gorm.DB) error {
+		msgs, err := repo.FetchPendingLocked(tx, limit)
 		if err != nil {
-			slog.Warn("send failed",
-				"outbox_id", msg.ID,
-				"aggregate_id", msg.AggregateID,
-				"kafka_key", msg.KafkaKey,
-				"error", err,
-			)
-			_ = repo.MarkFailed(msg.ID, err.Error())
-			continue
+			return err
 		}
-		_ = repo.MarkSent(msg.ID)
-		sentCount++
-	}
+		if len(msgs) == 0 {
+			return nil
+		}
 
-	if sentCount > 0 {
-		slog.Info("outbox batch processed",
-			"total", len(msgs),
-			"sent", sentCount,
-		)
-	}
+		sentCount := 0
+		for _, msg := range msgs {
+			err := producer.SendRaw(ctx, msg.KafkaKey, []byte(msg.Payload))
+			if err != nil {
+				slog.Warn("send failed",
+					"outbox_id", msg.ID,
+					"aggregate_id", msg.AggregateID,
+					"kafka_key", msg.KafkaKey,
+					"error", err,
+				)
+				_ = repo.MarkFailedTx(tx, msg.ID, err.Error())
+				continue
+			}
+			if err := repo.MarkSentTx(tx, msg.ID); err != nil {
+				slog.Warn("mark sent failed", "outbox_id", msg.ID, "error", err)
+			} else {
+				sentCount++
+			}
+		}
 
-	return nil
+		if sentCount > 0 {
+			slog.Info("outbox batch processed",
+				"total", len(msgs),
+				"sent", sentCount,
+			)
+		}
+		return nil
+	})
 }
 
 func getEnv(key, defaultValue string) string {
