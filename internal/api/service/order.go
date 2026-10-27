@@ -214,14 +214,27 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		freezeAsset = quoteAsset
 		if orderType == engine.TypeMarket {
 			ob := s.eng.GetOrderBook(req.Symbol)
-			bestPrice := ob.BestAsk()
-			if bestPrice == 0 {
-				bestPrice = ob.BestBid()
+			tempOrder := &engine.Order{
+				ID:        "estimate",
+				UserID:    req.UserID,
+				Side:      side,
+				Type:      engine.TypeMarket,
+				Price:     0,
+				Amount:    req.Amount,
+				Remaining: req.Amount,
 			}
-			if bestPrice == 0 {
-				return nil, fmt.Errorf("订单簿为空，无法估算市价单冻结金额")
+			estAvg, _ := ob.EstimateMatchAvgPrice(tempOrder)
+			if estAvg <= 0 {
+				bestPrice := ob.BestAsk()
+				if bestPrice == 0 {
+					bestPrice = ob.BestBid()
+				}
+				if bestPrice == 0 {
+					return nil, fmt.Errorf("订单簿为空，无法估算市价单冻结金额")
+				}
+				estAvg = bestPrice
 			}
-			freezeAmount = float64(bestPrice * req.Amount)
+			freezeAmount = float64(estAvg * req.Amount)
 		} else {
 			freezeAmount = float64(price * req.Amount)
 		}
@@ -295,6 +308,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 
 	// 11. 处理成交
 	var tradeResponses []TradeResponse
+	var orderSpentQuote float64
 	for _, trade := range trades {
 		tradeResponses = append(tradeResponses, TradeResponse{
 			Price:    trade.Price,
@@ -312,6 +326,10 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 
 		tradeAmount := float64(trade.Price * trade.Quantity)
 		tradeQty := float64(trade.Quantity)
+
+		if trade.BuyOrder == order.ID {
+			orderSpentQuote += tradeAmount
+		}
 
 		_ = s.balanceRepo.DeductFrozen(trade.BuyUserID, quoteAsset, tradeAmount)
 		_ = s.balanceRepo.AddBalance(trade.BuyUserID, baseAsset, tradeQty)
@@ -382,7 +400,10 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			var unfreezeAsset string
 			if side == engine.Buy {
 				unfreezeAsset = quoteAsset
-				unfreezeAmount = float64(order.Price * order.Remaining)
+				unfreezeAmount = freezeAmount - orderSpentQuote
+				if unfreezeAmount < 0 {
+					unfreezeAmount = 0
+				}
 			} else {
 				unfreezeAsset = baseAsset
 				unfreezeAmount = float64(order.Remaining)
@@ -517,7 +538,26 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 
 	if order.Side == "BUY" {
 		unfreezeAsset = quoteAsset
-		unfreezeAmount = float64(order.Price * order.Remaining)
+		spent := 0.0
+		if ts, err := s.repo.GetTradesByOrder(orderID); err == nil {
+			for _, t := range ts {
+				if t.BuyOrderID == orderID {
+					spent += float64(t.Price * t.Quantity)
+				}
+			}
+		}
+		freezeInitial := float64(order.Price * order.Amount)
+		if order.Price == 0 {
+			ref := ob.BestAsk()
+			if ref == 0 {
+				ref = ob.BestBid()
+			}
+			freezeInitial = float64(ref * order.Amount)
+		}
+		unfreezeAmount = freezeInitial - spent
+		if unfreezeAmount < 0 {
+			unfreezeAmount = 0
+		}
 	} else {
 		unfreezeAsset = baseAsset
 		unfreezeAmount = float64(order.Remaining)
