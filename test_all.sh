@@ -49,6 +49,7 @@ export HTTP_PORT="8080"
 
 # 7. 清理旧进程
 pkill -f "cmd/api/main.go" 2>/dev/null || true
+pkill -f "/main" 2>/dev/null || true
 pkill -f "cmd/outbox-publisher/main.go" 2>/dev/null || true
 pkill -f "cmd/event-consumer/main.go" 2>/dev/null || true
 sleep 1
@@ -71,6 +72,28 @@ cleanup() {
     kill "$API_PID" "$OUTBOX_PID" "$CONSUMER_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+
+# 重置环境并重启 API（清空内存订单簿与 Redis/DB）
+reset_and_restart_api() {
+    echo "🧹 重置环境并重启 API..."
+    pkill -f "cmd/api/main.go" 2>/dev/null || true
+    pkill -f "/main" 2>/dev/null || true
+    kill "$API_PID" 2>/dev/null || true
+    wait "$API_PID" 2>/dev/null || true
+    docker exec cex-mysql mysql -uroot -proot -e \
+        "USE cex; TRUNCATE TABLE orders; TRUNCATE TABLE trades; TRUNCATE TABLE balances; TRUNCATE TABLE ledgers; TRUNCATE TABLE outbox; TRUNCATE TABLE consumed_events;" 2>/dev/null || true
+    docker exec cex-redis redis-cli FLUSHALL >/dev/null 2>&1 || true
+    go run cmd/api/main.go > /tmp/cex_api.log 2>&1 &
+    API_PID=$!
+    for i in $(seq 1 30); do
+        if curl -s http://localhost:8080/health >/dev/null 2>&1; then
+            echo "✅ API 重启就绪"
+            break
+        fi
+        sleep 1
+    done
+}
 
 # 9. 等待 API 就绪
 echo "⏳ 等待 API 就绪..."
@@ -96,8 +119,14 @@ echo "[3/5] IOC/FOK 测试..."
 bash test/test_ioc_fok.sh
 
 echo ""
+reset_and_restart_api
+
+echo ""
 echo "[4/5] 订单类型测试..."
 bash test/test_order_types.sh
+
+echo ""
+reset_and_restart_api
 
 echo ""
 echo "[5/5] Outbox 测试..."

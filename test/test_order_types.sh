@@ -48,14 +48,14 @@ echo "✅ 充值完成（buyer: USDT 1000000，seller: BTC 1000）"
 echo ""
 
 # 2. IOC 部分成交：挂 SELL 3，IOC 买 10，应成交 3 剩余 7 取消
-echo "[2/8] IOC 部分成交：挂 SELL 3 @ 100，IOC 买 10 @ 100"
+echo "[2/8] IOC 部分成交：挂 SELL 3 @ 50000，IOC 买 10 @ 50000"
 curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":100,"amount":3}' > /dev/null
+    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":50000,"amount":3}' > /dev/null
 
 RESULT=$(curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"IOC","price":100,"amount":10}')
+    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"IOC","price":50000,"amount":10}')
 echo "   返回: $RESULT"
 
 if echo "$RESULT" | grep -q '"status":"CANCELED"'; then
@@ -73,14 +73,14 @@ fi
 echo ""
 
 # 3. FOK 失败：挂 SELL 3，FOK 买 10，对手不足，整单取消
-echo "[3/8] FOK 失败场景：挂 SELL 3 @ 100，FOK 买 10 @ 100"
+echo "[3/8] FOK 失败场景：挂 SELL 3 @ 50000，FOK 买 10 @ 50000"
 curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":100,"amount":3}' > /dev/null
+    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":50000,"amount":3}' > /dev/null
 
 RESULT=$(curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOK","price":100,"amount":10}')
+    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOK","price":50000,"amount":10}')
 echo "   返回: $RESULT"
 
 if echo "$RESULT" | grep -q '"status":"CANCELED"'; then
@@ -98,14 +98,14 @@ fi
 echo ""
 
 # 4. FOK 成功：挂 SELL 3，FOK 买 3，全部成交
-echo "[4/8] FOK 成功场景：挂 SELL 3 @ 100，FOK 买 3 @ 100"
+echo "[4/8] FOK 成功场景：挂 SELL 3 @ 50000，FOK 买 3 @ 50000"
 curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":100,"amount":3}' > /dev/null
+    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":50000,"amount":3}' > /dev/null
 
 RESULT=$(curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOK","price":100,"amount":3}')
+    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOK","price":50000,"amount":3}')
 echo "   返回: $RESULT"
 
 if echo "$RESULT" | grep -q '"status":"FILLED"'; then
@@ -117,14 +117,14 @@ fi
 echo ""
 
 # 5. LIMIT 部分成交 + 挂单：挂 SELL 5，LIMIT 买 10，成交 5 + 挂单 5
-echo "[5/8] LIMIT 部分成交 + 挂单：挂 SELL 5 @ 50，LIMIT 买 10 @ 50"
+echo "[5/8] LIMIT 部分成交 + 挂单：挂 SELL 5 @ 50000，LIMIT 买 10 @ 50000"
 curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":50,"amount":5}' > /dev/null
+    -d '{"user_id":"type_test_seller","symbol":"BTC/USDT","side":"SELL","order_type":"LIMIT","price":50000,"amount":5}' > /dev/null
 
 RESULT=$(curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"LIMIT","price":50,"amount":10}')
+    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"LIMIT","price":50000,"amount":10}')
 echo "   返回: $RESULT"
 
 if echo "$RESULT" | grep -q '"status":"PARTIALLY_FILLED"'; then
@@ -135,11 +135,11 @@ else
 fi
 echo ""
 
-# 6. LIMIT 纯挂单：买 5 @ 40，无对手盘，挂单 PENDING
-echo "[6/8] LIMIT 纯挂单：买 5 @ 40"
+# 6. LIMIT 纯挂单：买 1 @ 50000，无对手盘，挂单 PENDING
+echo "[6/8] LIMIT 纯挂单：买 1 @ 50000"
 RESULT=$(curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"LIMIT","price":40,"amount":5}')
+    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"LIMIT","price":50000,"amount":1}')
 echo "   返回: $RESULT"
 
 if echo "$RESULT" | grep -q '"status":"NEW"'; then
@@ -154,7 +154,7 @@ echo ""
 echo "[7/8] 非法 order_type：order_type=FOO"
 RESULT=$(curl -s -X POST "$API/orders" \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOO","price":40,"amount":5}')
+    -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOO","price":50000,"amount":5}')
 echo "   返回: $RESULT"
 
 if echo "$RESULT" | grep -q 'error'; then

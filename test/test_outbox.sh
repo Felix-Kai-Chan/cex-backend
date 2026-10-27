@@ -26,7 +26,7 @@ sleep 1
 
 docker exec cex-mysql mysql -uroot -proot cex \
     -e "TRUNCATE TABLE orders; TRUNCATE TABLE trades; TRUNCATE TABLE outbox;" 2>/dev/null
-redis-cli -p 6379 FLUSHDB > /dev/null
+docker exec cex-redis redis-cli FLUSHALL >/dev/null 2>&1 || true
 echo "✅ 环境已清"
 echo ""
 
@@ -143,8 +143,8 @@ KAFKA_MSG=$($KAFKA/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 \
     --topic cex.order.events \
     --from-beginning \
-    --max-messages 1 \
-    --timeout-ms 5000 2>/dev/null)
+    --max-messages 1000 \
+    --timeout-ms 15000 2>/dev/null)
 
 echo "   Kafka 收到: $KAFKA_MSG"
 
