@@ -238,7 +238,7 @@ func (s *Snapshotter) rebuildFromDB() error {
 
 	query := `SELECT order_id, user_id, side, price, remaining, created_at 
               FROM orders 
-              WHERE status IN ('PENDING', 'PARTIAL') 
+              WHERE status IN ('NEW', 'PARTIALLY_FILLED') 
               ORDER BY created_at ASC`
 
 	if err := s.db.Raw(query).Scan(&orders).Error; err != nil {

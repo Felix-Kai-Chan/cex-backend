@@ -145,9 +145,9 @@ func (r *TradeRepo) GetOrdersByUser(userID string) ([]OrderModel, error) {
 // CancelOrder 撤销订单（更新状态为 CANCELLED）
 func (r *TradeRepo) CancelOrder(orderID string) error {
 	return r.db.Model(&OrderModel{}).
-		Where("order_id = ? AND status IN ?", orderID, []string{"PENDING", "PARTIAL"}).
+		Where("order_id = ? AND status IN ?", orderID, []string{OrderStatusNew, OrderStatusPartiallyFilled}).
 		Updates(map[string]interface{}{
-			"status":     "CANCELLED",
+			"status":     OrderStatusCanceled,
 			"updated_at": time.Now(),
 		}).Error
 }

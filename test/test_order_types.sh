@@ -58,7 +58,7 @@ RESULT=$(curl -s -X POST "$API/orders" \
     -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"IOC","price":100,"amount":10}')
 echo "   返回: $RESULT"
 
-if echo "$RESULT" | grep -q '"status":"CANCELLED"'; then
+if echo "$RESULT" | grep -q '"status":"CANCELED"'; then
     TRADES=$(echo "$RESULT" | grep -o '"quantity"' | wc -l | tr -d ' ')
     if [ "$TRADES" -gt 0 ]; then
         echo "✅ IOC 通过：部分成交（$TRADES 笔）后取消"
@@ -83,7 +83,7 @@ RESULT=$(curl -s -X POST "$API/orders" \
     -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"FOK","price":100,"amount":10}')
 echo "   返回: $RESULT"
 
-if echo "$RESULT" | grep -q '"status":"CANCELLED"'; then
+if echo "$RESULT" | grep -q '"status":"CANCELED"'; then
     TRADES=$(echo "$RESULT" | grep -o '"quantity"' | wc -l | tr -d ' ')
     if [ "$TRADES" -eq 0 ]; then
         echo "✅ FOK 失败场景通过：整单取消（0 笔成交）"
@@ -127,7 +127,7 @@ RESULT=$(curl -s -X POST "$API/orders" \
     -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"LIMIT","price":50,"amount":10}')
 echo "   返回: $RESULT"
 
-if echo "$RESULT" | grep -q '"status":"PARTIAL"'; then
+if echo "$RESULT" | grep -q '"status":"PARTIALLY_FILLED"'; then
     echo "✅ LIMIT 通过：部分成交后挂单（PARTIAL）"
 else
     echo "❌ LIMIT 失败：状态应该 PARTIAL"
@@ -142,7 +142,7 @@ RESULT=$(curl -s -X POST "$API/orders" \
     -d '{"user_id":"type_test_buyer","symbol":"BTC/USDT","side":"BUY","order_type":"LIMIT","price":40,"amount":5}')
 echo "   返回: $RESULT"
 
-if echo "$RESULT" | grep -q '"status":"PENDING"'; then
+if echo "$RESULT" | grep -q '"status":"NEW"'; then
     echo "✅ LIMIT 纯挂单通过：状态 PENDING"
 else
     echo "❌ LIMIT 纯挂单失败：状态应该 PENDING"

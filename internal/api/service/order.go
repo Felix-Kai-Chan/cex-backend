@@ -340,15 +340,15 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		}
 	}
 
-	status := "PENDING"
+	status := persistence.OrderStatusNew
 	if order.Remaining == 0 {
-		status = "FILLED"
+		status = persistence.OrderStatusFilled
 	} else if order.TIF == engine.TIFIOC || order.TIF == engine.TIFFOK {
-		status = "CANCELLED"
+		status = persistence.OrderStatusCanceled
 	} else if order.TIF == engine.TIFGTD && order.ExpireAt > 0 && time.Now().UnixMilli() > order.ExpireAt {
-		status = "CANCELLED"
+		status = persistence.OrderStatusExpired
 	} else if order.Remaining < order.Amount {
-		status = "PARTIAL"
+		status = persistence.OrderStatusPartiallyFilled
 	}
 
 	settleErr := func() error {
@@ -393,11 +393,11 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			var buyerOrder persistence.OrderModel
 			if err := tx.Where("order_id = ?", trade.BuyOrder).First(&buyerOrder).Error; err == nil {
 				newRemaining := buyerOrder.Remaining - trade.Quantity
-				buyerStatus := "PENDING"
+				buyerStatus := persistence.OrderStatusNew
 				if newRemaining == 0 {
-					buyerStatus = "FILLED"
+					buyerStatus = persistence.OrderStatusFilled
 				} else if newRemaining < buyerOrder.Amount {
-					buyerStatus = "PARTIAL"
+					buyerStatus = persistence.OrderStatusPartiallyFilled
 				}
 				if err := s.repo.UpdateOrderTx(tx, trade.BuyOrder, newRemaining, buyerStatus); err != nil {
 					tx.Rollback()
@@ -409,11 +409,11 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 			var sellerOrder persistence.OrderModel
 			if err := tx.Where("order_id = ?", trade.SellOrder).First(&sellerOrder).Error; err == nil {
 				newRemaining := sellerOrder.Remaining - trade.Quantity
-				sellerStatus := "PENDING"
+				sellerStatus := persistence.OrderStatusNew
 				if newRemaining == 0 {
-					sellerStatus = "FILLED"
+					sellerStatus = persistence.OrderStatusFilled
 				} else if newRemaining < sellerOrder.Amount {
-					sellerStatus = "PARTIAL"
+					sellerStatus = persistence.OrderStatusPartiallyFilled
 				}
 				if err := s.repo.UpdateOrderTx(tx, trade.SellOrder, newRemaining, sellerStatus); err != nil {
 					tx.Rollback()
@@ -557,7 +557,7 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 		}
 	}()
 
-	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, string(orderType), string(tif), order.Price, order.Amount, order.Remaining, order.ExpireAt, "PENDING"); err != nil {
+	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, string(orderType), string(tif), order.Price, order.Amount, order.Remaining, order.ExpireAt, persistence.OrderStatusNew); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -574,7 +574,7 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 		ExpireAt:    order.ExpireAt,
 		Price:       order.Price,
 		Amount:      order.Amount,
-		Status:      "PENDING",
+		Status:      persistence.OrderStatusNew,
 		Timestamp:   order.Timestamp,
 	}
 	payload, err := json.Marshal(event)
@@ -621,10 +621,10 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		return fmt.Errorf("无权撤销此订单")
 	}
 
-	if order.Status == "FILLED" {
+	if order.Status == persistence.OrderStatusFilled {
 		return fmt.Errorf("订单已成交，无法撤销")
 	}
-	if order.Status == "CANCELLED" {
+	if order.Status == persistence.OrderStatusCanceled {
 		return fmt.Errorf("订单已撤销")
 	}
 
@@ -704,7 +704,7 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 
 	s.hub.BroadcastOrder(map[string]interface{}{
 		"order_id": orderID,
-		"status":   "CANCELLED",
+		"status":   persistence.OrderStatusCanceled,
 		"user_id":  userID,
 	})
 
@@ -724,7 +724,7 @@ func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, p
 		ExpireAt:    expireAt,
 		Price:       price,
 		Amount:      remaining,
-		Status:      "CANCELLED",
+		Status:      persistence.OrderStatusCanceled,
 		Timestamp:   time.Now().UnixMilli(),
 	}
 	payload, err := json.Marshal(event)
