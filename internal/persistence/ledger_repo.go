@@ -50,6 +50,23 @@ func (r *LedgerRepo) Record(userID, asset string, amount, balance, frozen float6
 	return r.db.Create(&entry).Error
 }
 
+// RecordTx 在指定事务内记录流水
+func (r *LedgerRepo) RecordTx(tx *gorm.DB, userID, asset string, amount, balance, frozen float64, ledgerType, orderID, tradeID, desc string) error {
+	entry := LedgerModel{
+		UserID:    userID,
+		Asset:     asset,
+		Amount:    amount,
+		Balance:   balance,
+		Frozen:    frozen,
+		Type:      ledgerType,
+		OrderID:   orderID,
+		TradeID:   tradeID,
+		Desc:      desc,
+		CreatedAt: time.Now(),
+	}
+	return tx.Create(&entry).Error
+}
+
 // GetLedgerByUser 查询用户流水
 func (r *LedgerRepo) GetLedgerByUser(userID string, entries *[]LedgerModel) error {
 	return r.db.Where("user_id = ?", userID).Order("created_at DESC").Find(entries).Error

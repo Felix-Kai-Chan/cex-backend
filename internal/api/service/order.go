@@ -268,7 +268,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	// 8. 撮合
 	ob := s.eng.GetOrderBook(req.Symbol)
 	matchStart := time.Now()
-	trades, changes, _ := ob.Match(order)
+	trades, changes, rollback := ob.Match(order)
 	matchDuration := time.Since(matchStart)
 
 	// 9. 记 metrics + 更新熔断器
@@ -277,24 +277,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		breaker.UpdatePrice(trade.Price)
 	}
 
-	// 10. 写 WAL
-	if snapshotter := s.eng.GetSnapshotter(req.Symbol); snapshotter != nil {
-		var walEntries []engine.WALEntry
-		for _, ch := range changes {
-			walEntries = append(walEntries, engine.WALEntry{
-				Op:        ch.Op,
-				OrderID:   ch.OrderID,
-				UserID:    ch.UserID,
-				Side:      ch.Side,
-				Price:     ch.Price,
-				Remaining: ch.Remaining,
-				Timestamp: ch.Timestamp,
-			})
-		}
-		if err := snapshotter.AppendWALBatch(walEntries); err != nil {
-			slog.Warn("写 WAL 失败", "order_id", order.ID, "error", err)
-		}
-	}
+	// 10. WAL 将在 DB 事务提交成功后追加（见下方结算事务之后）
 
 	slog.Info("match completed",
 		"order_id", order.ID,
@@ -306,74 +289,19 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		"match_us", matchDuration.Microseconds(),
 	)
 
-	// 11. 处理成交
-	var tradeResponses []TradeResponse
-	var orderSpentQuote float64
+	// 11. 事务化结算（内存撮合已完成，此处持久化所有副作用）
+	tradeResponses := make([]TradeResponse, 0, len(trades))
+	orderSpentQuote := 0.0
 	for _, trade := range trades {
 		tradeResponses = append(tradeResponses, TradeResponse{
 			Price:    trade.Price,
 			Quantity: trade.Quantity,
 		})
-
-		_ = s.repo.SaveTrade(
-			trade.TradeID,
-			trade.BuyOrder,
-			trade.SellOrder,
-			trade.Price,
-			trade.Quantity,
-			trade.Timestamp,
-		)
-
-		tradeAmount := float64(trade.Price * trade.Quantity)
-		tradeQty := float64(trade.Quantity)
-
 		if trade.BuyOrder == order.ID {
-			orderSpentQuote += tradeAmount
+			orderSpentQuote += float64(trade.Price * trade.Quantity)
 		}
-
-		_ = s.balanceRepo.DeductFrozen(trade.BuyUserID, quoteAsset, tradeAmount)
-		_ = s.balanceRepo.AddBalance(trade.BuyUserID, baseAsset, tradeQty)
-
-		_ = s.balanceRepo.DeductFrozen(trade.SellUserID, baseAsset, tradeQty)
-		_ = s.balanceRepo.AddBalance(trade.SellUserID, quoteAsset, tradeAmount)
-
-		var buyerOrder persistence.OrderModel
-		if err := s.repo.GetOrderByID(trade.BuyOrder, &buyerOrder); err == nil {
-			newRemaining := buyerOrder.Remaining - trade.Quantity
-			status := "PENDING"
-			if newRemaining == 0 {
-				status = "FILLED"
-			} else if newRemaining < buyerOrder.Amount {
-				status = "PARTIAL"
-			}
-			_ = s.repo.UpdateOrder(trade.BuyOrder, newRemaining, status)
-		}
-
-		var sellerOrder persistence.OrderModel
-		if err := s.repo.GetOrderByID(trade.SellOrder, &sellerOrder); err == nil {
-			newRemaining := sellerOrder.Remaining - trade.Quantity
-			status := "PENDING"
-			if newRemaining == 0 {
-				status = "FILLED"
-			} else if newRemaining < sellerOrder.Amount {
-				status = "PARTIAL"
-			}
-			_ = s.repo.UpdateOrder(trade.SellOrder, newRemaining, status)
-		}
-
-		_ = s.ledger.Record(
-			trade.BuyUserID, quoteAsset, -tradeAmount,
-			0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
-			fmt.Sprintf("买入 %d 数量，价格 %d", trade.Quantity, trade.Price),
-		)
-		_ = s.ledger.Record(
-			trade.SellUserID, quoteAsset, tradeAmount,
-			0, 0, "TRADE", trade.SellOrder, trade.TradeID,
-			fmt.Sprintf("卖出 %d 数量，价格 %d", trade.Quantity, trade.Price),
-		)
 	}
 
-	// 12. 更新当前订单状态
 	status := "PENDING"
 	if order.Remaining == 0 {
 		status = "FILLED"
@@ -382,33 +310,183 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	} else if order.Remaining < order.Amount {
 		status = "PARTIAL"
 	}
-	_ = s.repo.UpdateOrder(order.ID, order.Remaining, status)
 
-	// 13. 解冻未成交部分
-	if order.Remaining > 0 {
-		shouldUnfreeze := false
-		if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
-			shouldUnfreeze = true
-		} else if orderType == engine.TypeMarket {
-			shouldUnfreeze = true
-		} else if orderType == engine.TypeLimit && order.Remaining < order.Amount {
-			shouldUnfreeze = true
+	settleErr := func() error {
+		tx := s.db.Begin()
+		if tx.Error != nil {
+			return tx.Error
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				tx.Rollback()
+				panic(r)
+			}
+		}()
+
+		for _, trade := range trades {
+			if err := s.repo.SaveTradeTx(tx, trade.TradeID, trade.BuyOrder, trade.SellOrder, trade.Price, trade.Quantity, trade.Timestamp); err != nil {
+				tx.Rollback()
+				return err
+			}
+
+			tradeAmount := float64(trade.Price * trade.Quantity)
+			tradeQty := float64(trade.Quantity)
+
+			if err := s.balanceRepo.DeductFrozenTx(tx, trade.BuyUserID, quoteAsset, tradeAmount); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if err := s.balanceRepo.AddBalanceTx(tx, trade.BuyUserID, baseAsset, tradeQty); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if err := s.balanceRepo.DeductFrozenTx(tx, trade.SellUserID, baseAsset, tradeQty); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if err := s.balanceRepo.AddBalanceTx(tx, trade.SellUserID, quoteAsset, tradeAmount); err != nil {
+				tx.Rollback()
+				return err
+			}
+
+			// 买家订单状态
+			var buyerOrder persistence.OrderModel
+			if err := tx.Where("order_id = ?", trade.BuyOrder).First(&buyerOrder).Error; err == nil {
+				newRemaining := buyerOrder.Remaining - trade.Quantity
+				buyerStatus := "PENDING"
+				if newRemaining == 0 {
+					buyerStatus = "FILLED"
+				} else if newRemaining < buyerOrder.Amount {
+					buyerStatus = "PARTIAL"
+				}
+				if err := s.repo.UpdateOrderTx(tx, trade.BuyOrder, newRemaining, buyerStatus); err != nil {
+					tx.Rollback()
+					return err
+				}
+			}
+
+			// 卖家订单状态
+			var sellerOrder persistence.OrderModel
+			if err := tx.Where("order_id = ?", trade.SellOrder).First(&sellerOrder).Error; err == nil {
+				newRemaining := sellerOrder.Remaining - trade.Quantity
+				sellerStatus := "PENDING"
+				if newRemaining == 0 {
+					sellerStatus = "FILLED"
+				} else if newRemaining < sellerOrder.Amount {
+					sellerStatus = "PARTIAL"
+				}
+				if err := s.repo.UpdateOrderTx(tx, trade.SellOrder, newRemaining, sellerStatus); err != nil {
+					tx.Rollback()
+					return err
+				}
+			}
+
+			_ = s.ledger.RecordTx(tx, trade.BuyUserID, quoteAsset, -tradeAmount, 0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
+				fmt.Sprintf("买入 %d 数量，价格 %d", trade.Quantity, trade.Price))
+			_ = s.ledger.RecordTx(tx, trade.SellUserID, quoteAsset, tradeAmount, 0, 0, "TRADE", trade.SellOrder, trade.TradeID,
+				fmt.Sprintf("卖出 %d 数量，价格 %d", trade.Quantity, trade.Price))
+
+			// 成交事件 Outbox
+			event := mq.OrderEvent{
+				EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+				EventType: mq.EventTradeFilled,
+				OrderID:   trade.BuyOrder,
+				UserID:    trade.BuyUserID,
+				Symbol:    req.Symbol,
+				Side:      "BUY",
+				Price:     trade.Price,
+				Amount:    trade.Quantity,
+				Status:    "FILLED",
+				Timestamp: trade.Timestamp,
+			}
+			payload, _ := json.Marshal(event)
+			outboxMsg := &persistence.OutboxModel{
+				AggregateID: trade.TradeID,
+				KafkaKey:    req.Symbol,
+				Topic:       s.kafkaTopic,
+				Payload:     string(payload),
+				Status:      "PENDING",
+			}
+			if err := s.outboxRepo.Create(tx, outboxMsg); err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
 
-		if shouldUnfreeze {
-			var unfreezeAmount float64
-			var unfreezeAsset string
-			if side == engine.Buy {
-				unfreezeAsset = quoteAsset
-				unfreezeAmount = freezeAmount - orderSpentQuote
-				if unfreezeAmount < 0 {
-					unfreezeAmount = 0
-				}
-			} else {
-				unfreezeAsset = baseAsset
-				unfreezeAmount = float64(order.Remaining)
+		// 当前订单状态
+		if err := s.repo.UpdateOrderTx(tx, order.ID, order.Remaining, status); err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		// 解冻未成交部分（事务内）
+		if order.Remaining > 0 {
+			shouldUnfreeze := false
+			if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
+				shouldUnfreeze = true
+			} else if orderType == engine.TypeMarket {
+				shouldUnfreeze = true
+			} else if orderType == engine.TypeLimit && order.Remaining < order.Amount {
+				shouldUnfreeze = true
 			}
-			_ = s.balanceRepo.UnfreezeBalance(order.UserID, unfreezeAsset, unfreezeAmount)
+
+			if shouldUnfreeze {
+				var unfreezeAmount float64
+				var unfreezeAsset string
+				if side == engine.Buy {
+					unfreezeAsset = quoteAsset
+					unfreezeAmount = freezeAmount - orderSpentQuote
+					if unfreezeAmount < 0 {
+						unfreezeAmount = 0
+					}
+				} else {
+					unfreezeAsset = baseAsset
+					unfreezeAmount = float64(order.Remaining)
+				}
+				if err := s.balanceRepo.UnfreezeBalanceTx(tx, order.UserID, unfreezeAsset, unfreezeAmount); err != nil {
+					tx.Rollback()
+					return err
+				}
+			}
+		}
+
+		return tx.Commit().Error
+	}()
+
+	if settleErr != nil {
+		// 逆向恢复内存订单簿
+		ob := s.eng.GetOrderBook(req.Symbol)
+		ob.RollbackMatch(rollback)
+
+		// DB 清理：标记订单取消、解冻资金
+		_ = s.repo.CancelOrder(order.ID)
+		_ = s.balanceRepo.UnfreezeBalance(req.UserID, freezeAsset, freezeAmount)
+
+		slog.Error("order settlement failed, rolled back",
+			"order_id", order.ID,
+			"error", settleErr,
+		)
+		return nil, fmt.Errorf("订单结算失败: %w", settleErr)
+	}
+
+	// 12. DB 提交成功后追加 WAL
+	if snapshotter := s.eng.GetSnapshotter(req.Symbol); snapshotter != nil {
+		var walEntries []engine.WALEntry
+		for _, ch := range changes {
+			walEntries = append(walEntries, engine.WALEntry{
+				Op:        ch.Op,
+				OrderID:   ch.OrderID,
+				UserID:    ch.UserID,
+				Side:      ch.Side,
+				Price:     ch.Price,
+				Remaining: ch.Remaining,
+				Timestamp: ch.Timestamp,
+				Type:      ch.Type,
+				Amount:    ch.Amount,
+			})
+		}
+		if err := snapshotter.AppendWALBatch(walEntries); err != nil {
+			slog.Warn("写 WAL 失败", "order_id", order.ID, "error", err)
 		}
 	}
 

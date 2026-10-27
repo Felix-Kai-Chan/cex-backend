@@ -13,14 +13,16 @@ import (
 
 // WALEntry WAL 操作日志条目
 type WALEntry struct {
-	Op        string `json:"op"`
-	OrderID   string `json:"order_id"`
-	UserID    string `json:"user_id"`
-	Side      string `json:"side"`
-	Price     int64  `json:"price"`
-	Remaining int64  `json:"remaining"`
-	Timestamp int64  `json:"timestamp"`
-	TradeID   string `json:"trade_id,omitempty"`
+	Op        string    `json:"op"`
+	OrderID   string    `json:"order_id"`
+	UserID    string    `json:"user_id"`
+	Side      string    `json:"side"`
+	Type      OrderType `json:"type,omitempty"`
+	Price     int64     `json:"price"`
+	Amount    int64     `json:"amount,omitempty"`
+	Remaining int64     `json:"remaining"`
+	Timestamp int64     `json:"timestamp"`
+	TradeID   string    `json:"trade_id,omitempty"`
 }
 
 // Snapshot 快照结构

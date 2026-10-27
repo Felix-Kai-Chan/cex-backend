@@ -78,6 +78,17 @@ func (r *TradeRepo) UpdateOrder(orderID string, remaining int64, status string) 
 		}).Error
 }
 
+// UpdateOrderTx 在指定事务内更新订单状态
+func (r *TradeRepo) UpdateOrderTx(tx *gorm.DB, orderID string, remaining int64, status string) error {
+	return tx.Model(&OrderModel{}).
+		Where("order_id = ?", orderID).
+		Updates(map[string]interface{}{
+			"remaining":  remaining,
+			"status":     status,
+			"updated_at": time.Now(),
+		}).Error
+}
+
 // SaveTrade 保存成交记录
 func (r *TradeRepo) SaveTrade(tradeID, buyOrderID, sellOrderID string, price, quantity, timestamp int64) error {
 	trade := TradeModel{
@@ -89,6 +100,19 @@ func (r *TradeRepo) SaveTrade(tradeID, buyOrderID, sellOrderID string, price, qu
 		Timestamp:   timestamp,
 	}
 	return r.db.Create(&trade).Error
+}
+
+// SaveTradeTx 在指定事务内保存成交记录
+func (r *TradeRepo) SaveTradeTx(tx *gorm.DB, tradeID, buyOrderID, sellOrderID string, price, quantity, timestamp int64) error {
+	trade := TradeModel{
+		TradeID:     tradeID,
+		BuyOrderID:  buyOrderID,
+		SellOrderID: sellOrderID,
+		Price:       price,
+		Quantity:    quantity,
+		Timestamp:   timestamp,
+	}
+	return tx.Create(&trade).Error
 }
 
 // GetTradesByOrder 查询某个订单的所有成交记录

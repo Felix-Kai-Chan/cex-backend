@@ -49,7 +49,9 @@ type OrderChange struct {
 	OrderID   string
 	UserID    string
 	Side      string
+	Type      OrderType
 	Price     int64
+	Amount    int64
 	Remaining int64
 	Timestamp int64
 }
@@ -228,6 +230,9 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 
 			removedMaker := *matchOrder
 			removedMaker.Remaining = prevMakerRemaining
+			if prev, ok := rollback.PartialMakers[matchOrder.ID]; ok {
+				removedMaker.Remaining = prev
+			}
 			removedMaker.Next = nil
 			rollback.RemovedMakers = append(rollback.RemovedMakers, removedMaker)
 			delete(rollback.PartialMakers, matchOrder.ID)
@@ -256,7 +261,9 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 				OrderID:   order.ID,
 				UserID:    order.UserID,
 				Side:      string(order.Side),
+				Type:      order.Type,
 				Price:     order.Price,
+				Amount:    order.Amount,
 				Remaining: order.Remaining,
 				Timestamp: order.Timestamp,
 			})
@@ -435,6 +442,69 @@ func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 	delete(ob.orders, orderID)
 
 	return removed, nil
+}
+
+// RollbackMatch 按 RollbackData 逆向恢复内存订单簿（DB 事务失败时调用）
+// 调用方需在事务失败后调用；本方法自行获取写锁。
+func (ob *OrderBook) RollbackMatch(rb RollbackData) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
+	for _, id := range rb.AddedOrderIDs {
+		ob.removeOrderLocked(id)
+	}
+
+	for _, maker := range rb.RemovedMakers {
+		m := maker
+		m.Next = nil
+		if _, exists := ob.orders[m.ID]; !exists {
+			ob.addOrderLocked(&m)
+		}
+	}
+
+	for id, prevRemaining := range rb.PartialMakers {
+		if o, ok := ob.orders[id]; ok {
+			o.Remaining = prevRemaining
+		}
+	}
+}
+
+// removeOrderLocked 从订单簿移除订单（不加锁，内部使用）
+func (ob *OrderBook) removeOrderLocked(orderID string) {
+	order, ok := ob.orders[orderID]
+	if !ok {
+		return
+	}
+
+	var list *OrderList
+	if order.Side == Buy {
+		list = ob.bids[order.Price]
+	} else {
+		list = ob.asks[order.Price]
+	}
+
+	if list == nil || list.Head == nil {
+		delete(ob.orders, orderID)
+		return
+	}
+
+	removed := ob.removeFromList(list, orderID)
+	if removed == nil {
+		delete(ob.orders, orderID)
+		return
+	}
+
+	if list.Head == nil {
+		if order.Side == Buy {
+			delete(ob.bids, order.Price)
+			ob.bidPrices.Remove(order.Price)
+		} else {
+			delete(ob.asks, order.Price)
+			ob.askPrices.Remove(order.Price)
+		}
+	}
+
+	delete(ob.orders, orderID)
 }
 
 // removeFromList 从链表中移除订单

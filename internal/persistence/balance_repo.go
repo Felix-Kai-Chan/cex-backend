@@ -173,3 +173,64 @@ func (r *BalanceRepo) DeductFrozen(userID, asset string, amount float64) error {
 			Update("total", gorm.Expr("available + frozen")).Error
 	})
 }
+
+// DeductFrozenTx 在指定事务内从冻结余额中扣减
+func (r *BalanceRepo) DeductFrozenTx(tx *gorm.DB, userID, asset string, amount float64) error {
+	result := tx.Model(&BalanceModel{}).
+		Where("user_id = ? AND asset = ? AND frozen >= ?", userID, asset, amount).
+		Update("frozen", gorm.Expr("frozen - ?", amount))
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("冻结余额不足")
+	}
+
+	return tx.Model(&BalanceModel{}).
+		Where("user_id = ? AND asset = ?", userID, asset).
+		Update("total", gorm.Expr("available + frozen")).Error
+}
+
+// AddBalanceTx 在指定事务内入账
+func (r *BalanceRepo) AddBalanceTx(tx *gorm.DB, userID, asset string, amount float64) error {
+	result := tx.Model(&BalanceModel{}).
+		Where("user_id = ? AND asset = ?", userID, asset).
+		Update("available", gorm.Expr("available + ?", amount))
+
+	if result.Error != nil {
+		return result.Error
+	}
+
+	if result.RowsAffected > 0 {
+		return tx.Model(&BalanceModel{}).
+			Where("user_id = ? AND asset = ?", userID, asset).
+			Update("total", gorm.Expr("available + frozen")).Error
+	}
+
+	return tx.Create(&BalanceModel{
+		UserID:    userID,
+		Asset:     asset,
+		Available: amount,
+		Frozen:    0,
+		Total:     amount,
+	}).Error
+}
+
+// UnfreezeBalanceTx 在指定事务内解冻余额
+func (r *BalanceRepo) UnfreezeBalanceTx(tx *gorm.DB, userID, asset string, amount float64) error {
+	result := tx.Model(&BalanceModel{}).
+		Where("user_id = ? AND asset = ? AND frozen >= ?", userID, asset, amount).
+		Updates(map[string]interface{}{
+			"available": gorm.Expr("available + ?", amount),
+			"frozen":    gorm.Expr("frozen - ?", amount),
+		})
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("冻结余额不足或并发解冻冲突")
+	}
+	return nil
+}
