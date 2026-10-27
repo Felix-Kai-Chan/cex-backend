@@ -8,17 +8,20 @@ import (
 
 // OrderModel 订单表（历史记录）
 type OrderModel struct {
-	ID        uint   `gorm:"primaryKey"`
-	OrderID   string `gorm:"uniqueIndex;size:64"`
-	UserID    string `gorm:"index;size:64"`
-	Symbol    string `gorm:"index;size:32"` // ✅ 新增：交易对
-	Side      string `gorm:"size:8"`        // BUY / SELL
-	Price     int64
-	Amount    int64
-	Remaining int64
-	Status    string `gorm:"size:20"` // PENDING / PARTIAL / FILLED / CANCELLED
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID           uint   `gorm:"primaryKey"`
+	OrderID      string `gorm:"uniqueIndex;size:64"`
+	UserID       string `gorm:"index;size:64"`
+	Symbol       string `gorm:"index;size:32"`
+	Side         string `gorm:"size:8"`
+	OrderType    string `gorm:"size:16;column:order_type"` // LIMIT / MARKET
+	TimeInForce  string `gorm:"size:8;column:time_in_force"` // GTC / IOC / FOK / GTD
+	ExpireAt     int64  `gorm:"column:expire_at"`
+	Price        int64
+	Amount       int64
+	Remaining    int64
+	Status       string `gorm:"size:20"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 func (OrderModel) TableName() string {
@@ -53,16 +56,19 @@ func NewTradeRepo(db *gorm.DB) *TradeRepo {
 
 // SaveOrder 保存订单
 // ✅ 新增 symbol 参数
-func (r *TradeRepo) SaveOrder(orderID, userID, symbol, side string, price, amount, remaining int64, status string) error {
+func (r *TradeRepo) SaveOrder(orderID, userID, symbol, side string, orderType, timeInForce string, price, amount, remaining int64, expireAt int64, status string) error {
 	order := OrderModel{
-		OrderID:   orderID,
-		UserID:    userID,
-		Symbol:    symbol,
-		Side:      side,
-		Price:     price,
-		Amount:    amount,
-		Remaining: remaining,
-		Status:    status,
+		OrderID:     orderID,
+		UserID:      userID,
+		Symbol:      symbol,
+		Side:        side,
+		OrderType:   orderType,
+		TimeInForce: timeInForce,
+		ExpireAt:    expireAt,
+		Price:       price,
+		Amount:      amount,
+		Remaining:   remaining,
+		Status:      status,
 	}
 	return r.db.Create(&order).Error
 }
@@ -147,16 +153,19 @@ func (r *TradeRepo) CancelOrder(orderID string) error {
 }
 
 // SaveOrderTx 在指定事务内保存订单
-func (r *TradeRepo) SaveOrderTx(tx *gorm.DB, orderID, userID, symbol, side string, price, amount, remaining int64, status string) error {
+func (r *TradeRepo) SaveOrderTx(tx *gorm.DB, orderID, userID, symbol, side string, orderType, timeInForce string, price, amount, remaining int64, expireAt int64, status string) error {
 	order := OrderModel{
-		OrderID:   orderID,
-		UserID:    userID,
-		Symbol:    symbol,
-		Side:      side,
-		Price:     price,
-		Amount:    amount,
-		Remaining: remaining,
-		Status:    status,
+		OrderID:     orderID,
+		UserID:      userID,
+		Symbol:      symbol,
+		Side:        side,
+		OrderType:   orderType,
+		TimeInForce: timeInForce,
+		ExpireAt:    expireAt,
+		Price:       price,
+		Amount:      amount,
+		Remaining:   remaining,
+		Status:      status,
 	}
 	return tx.Create(&order).Error
 }

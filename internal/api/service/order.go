@@ -69,12 +69,14 @@ func NewOrderService(
 }
 
 type CreateOrderRequest struct {
-	UserID    string `json:"user_id"`
-	Symbol    string `json:"symbol"`
-	Side      string `json:"side"`
-	OrderType string `json:"order_type"`
-	Price     int64  `json:"price"`
-	Amount    int64  `json:"amount"`
+	UserID      string `json:"user_id"`
+	Symbol      string `json:"symbol"`
+	Side        string `json:"side"`
+	OrderType   string `json:"order_type"`
+	TimeInForce string `json:"time_in_force"`
+	ExpireAt    int64  `json:"expire_at"`
+	Price       int64  `json:"price"`
+	Amount      int64  `json:"amount"`
 }
 
 type CreateOrderResponse struct {
@@ -116,22 +118,56 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("交易对 %s 因价格波动过大已熔断，剩余 %d 秒", req.Symbol, remainSec)
 	}
 
-	// 3. 订单类型校验
+	// 3. 订单类型校验 + 兼容映射
 	if req.OrderType == "" {
 		req.OrderType = "LIMIT"
 	}
+	if req.TimeInForce == "" {
+		// 兼容旧请求：按 order_type 推断 TIF
+		switch req.OrderType {
+		case "MARKET":
+			req.TimeInForce = "IOC"
+		case "IOC":
+			req.TimeInForce = "IOC"
+		case "FOK":
+			req.TimeInForce = "FOK"
+		default:
+			req.TimeInForce = "GTC"
+		}
+	}
+
+	// 兼容旧 order_type=IOC/FOK
+	switch req.OrderType {
+	case "IOC", "FOK":
+		req.OrderType = "LIMIT"
+	}
+
 	var orderType engine.OrderType
 	switch req.OrderType {
 	case "LIMIT":
 		orderType = engine.TypeLimit
 	case "MARKET":
 		orderType = engine.TypeMarket
-	case "IOC":
-		orderType = engine.TypeIOC
-	case "FOK":
-		orderType = engine.TypeFOK
 	default:
-		return nil, fmt.Errorf("order_type 必须是 LIMIT / MARKET / IOC / FOK")
+		return nil, fmt.Errorf("order_type 必须是 LIMIT / MARKET")
+	}
+
+	var tif engine.TimeInForce
+	switch req.TimeInForce {
+	case "GTC":
+		tif = engine.TIFGTC
+	case "IOC":
+		tif = engine.TIFIOC
+	case "FOK":
+		tif = engine.TIFFOK
+	case "GTD":
+		tif = engine.TIFGTD
+	default:
+		return nil, fmt.Errorf("time_in_force 必须是 GTC / IOC / FOK / GTD")
+	}
+
+	if tif == engine.TIFGTD && req.ExpireAt <= 0 {
+		return nil, fmt.Errorf("GTD 订单必须提供 expire_at")
 	}
 
 	// 4. 价格校验
@@ -253,6 +289,8 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		UserID:    req.UserID,
 		Side:      side,
 		Type:      orderType,
+		TIF:       tif,
+		ExpireAt:  req.ExpireAt,
 		Price:     price,
 		Amount:    req.Amount,
 		Remaining: req.Amount,
@@ -260,7 +298,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}
 
 	// 7.1 同事务写 order + outbox
-	if err := s.saveOrderWithOutbox(order, req); err != nil {
+	if err := s.saveOrderWithOutbox(order, req, orderType, tif); err != nil {
 		_ = s.balanceRepo.UnfreezeBalance(req.UserID, freezeAsset, freezeAmount)
 		return nil, fmt.Errorf("订单创建失败: %w", err)
 	}
@@ -305,7 +343,9 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	status := "PENDING"
 	if order.Remaining == 0 {
 		status = "FILLED"
-	} else if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
+	} else if order.TIF == engine.TIFIOC || order.TIF == engine.TIFFOK {
+		status = "CANCELLED"
+	} else if order.TIF == engine.TIFGTD && order.ExpireAt > 0 && time.Now().UnixMilli() > order.ExpireAt {
 		status = "CANCELLED"
 	} else if order.Remaining < order.Amount {
 		status = "PARTIAL"
@@ -422,11 +462,9 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		// 解冻未成交部分（事务内）
 		if order.Remaining > 0 {
 			shouldUnfreeze := false
-			if orderType == engine.TypeIOC || orderType == engine.TypeFOK {
+			if order.TIF == engine.TIFIOC || order.TIF == engine.TIFFOK {
 				shouldUnfreeze = true
 			} else if orderType == engine.TypeMarket {
-				shouldUnfreeze = true
-			} else if orderType == engine.TypeLimit && order.Remaining < order.Amount {
 				shouldUnfreeze = true
 			}
 
@@ -502,7 +540,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}, nil
 }
 
-func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrderRequest) error {
+func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrderRequest, orderType engine.OrderType, tif engine.TimeInForce) error {
 	tx := s.db.Begin()
 	if tx.Error != nil {
 		return tx.Error
@@ -514,22 +552,25 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 		}
 	}()
 
-	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, order.Price, order.Amount, order.Remaining, "PENDING"); err != nil {
+	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, string(orderType), string(tif), order.Price, order.Amount, order.Remaining, order.ExpireAt, "PENDING"); err != nil {
 		tx.Rollback()
 		return err
 	}
 
 	event := mq.OrderEvent{
-		EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType: mq.EventOrderCreated,
-		OrderID:   order.ID,
-		UserID:    order.UserID,
-		Symbol:    req.Symbol,
-		Side:      string(order.Side),
-		Price:     order.Price,
-		Amount:    order.Amount,
-		Status:    "PENDING",
-		Timestamp: order.Timestamp,
+		EventID:     fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:   mq.EventOrderCreated,
+		OrderID:     order.ID,
+		UserID:      order.UserID,
+		Symbol:      req.Symbol,
+		Side:        string(order.Side),
+		OrderType:   string(orderType),
+		TimeInForce: string(tif),
+		ExpireAt:    order.ExpireAt,
+		Price:       order.Price,
+		Amount:      order.Amount,
+		Status:      "PENDING",
+		Timestamp:   order.Timestamp,
 	}
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -606,7 +647,7 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		})
 	}
 
-	go s.writeCancelOutbox(orderID, userID, symbol, order.Side, order.Price, order.Remaining)
+	go s.writeCancelOutbox(orderID, userID, symbol, order.Side, order.Price, order.Remaining, order.TimeInForce, order.ExpireAt)
 
 	baseAsset := getBaseAsset(symbol)
 	quoteAsset := getQuoteAsset(symbol)
@@ -665,18 +706,21 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	return nil
 }
 
-func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, price, remaining int64) {
+func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, price, remaining int64, timeInForce string, expireAt int64) {
 	event := mq.OrderEvent{
-		EventID:   fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType: mq.EventOrderCancelled,
-		OrderID:   orderID,
-		UserID:    userID,
-		Symbol:    symbol,
-		Side:      side,
-		Price:     price,
-		Amount:    remaining,
-		Status:    "CANCELLED",
-		Timestamp: time.Now().UnixMilli(),
+		EventID:     fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:   mq.EventOrderCancelled,
+		OrderID:     orderID,
+		UserID:      userID,
+		Symbol:      symbol,
+		Side:        side,
+		OrderType:   "", // unknown on cancel path; keep empty
+		TimeInForce: timeInForce,
+		ExpireAt:    expireAt,
+		Price:       price,
+		Amount:      remaining,
+		Status:      "CANCELLED",
+		Timestamp:   time.Now().UnixMilli(),
 	}
 	payload, err := json.Marshal(event)
 	if err != nil {
