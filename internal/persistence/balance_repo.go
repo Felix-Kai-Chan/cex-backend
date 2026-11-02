@@ -129,6 +129,23 @@ func (r *BalanceRepo) FreezeBalance(userID, asset string, amount float64) error 
 	})
 }
 
+// FreezeBalanceTx 在给定事务中冻结余额
+func (r *BalanceRepo) FreezeBalanceTx(tx *gorm.DB, userID, asset string, amount float64) error {
+	result := tx.Model(&BalanceModel{}).
+		Where("user_id = ? AND asset = ? AND available >= ?", userID, asset, amount).
+		Updates(map[string]interface{}{
+			"available": gorm.Expr("available - ?", amount),
+			"frozen":    gorm.Expr("frozen + ?", amount),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("余额不足或并发冻结冲突")
+	}
+	return nil
+}
+
 // UnfreezeBalance 解冻余额（撤单/成交失败时调用）
 // ✅ 原子条件更新：WHERE frozen >= amount
 func (r *BalanceRepo) UnfreezeBalance(userID, asset string, amount float64) error {

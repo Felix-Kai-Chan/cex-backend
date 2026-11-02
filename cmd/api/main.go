@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"cex-backend/internal/api/handler"
 	"cex-backend/internal/api/service"
@@ -147,14 +148,19 @@ func main() {
 }
 
 func RequestLogger() gin.HandlerFunc {
+	if os.Getenv("CEX_ACCESS_LOG") == "0" {
+		return func(c *gin.Context) { c.Next() }
+	}
+
 	return func(c *gin.Context) {
+		start := time.Now()
 		c.Next()
 
 		slog.Info("request",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
 			"status", c.Writer.Status(),
-			"latency_ms", c.Writer.Size(),
+			"latency_ms", time.Since(start).Milliseconds(),
 			"client_ip", c.ClientIP(),
 		)
 	}

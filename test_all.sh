@@ -15,10 +15,29 @@ echo "   CEX 一键测试（含所有 cmd 服务）"
 echo "=========================================="
 
 # ---------- 基础检查 ----------
-if ! docker info >/dev/null 2>&1; then
-    echo "❌ Docker 未运行，请先启动 Docker Desktop"
+ensure_docker() {
+    if docker info >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "🐳 Docker 未运行，尝试启动 Docker Desktop..."
+    if [[ "$OSTYPE" == darwin* ]]; then
+        open -a Docker >/dev/null 2>&1 || true
+    fi
+
+    for i in $(seq 1 60); do
+        if docker info >/dev/null 2>&1; then
+            echo "✅ Docker 已启动"
+            return 0
+        fi
+        sleep 2
+    done
+
+    echo "❌ Docker 启动失败，请手动打开 Docker Desktop"
     exit 1
-fi
+}
+
+ensure_docker
 
 # ---------- 进程清理 ----------
 stop_cmd_services() {

@@ -75,8 +75,10 @@ type Order struct {
 
 // OrderList 价格链表（同价格按时间排序）
 type OrderList struct {
-	Head *Order
-	Tail *Order
+	Head   *Order
+	Tail   *Order
+	Volume int64
+	Count  int
 }
 
 // OrderChange 订单变更事件（用于写 WAL）
@@ -148,6 +150,8 @@ func (ob *OrderBook) addOrderLocked(order *Order) {
 		list.Tail.Next = order
 		list.Tail = order
 	}
+	list.Volume += order.Remaining
+	list.Count++
 
 	ob.orders[order.ID] = order
 }
@@ -232,6 +236,8 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 
 		// GTD 过期挂单：摘除并继续（TODO: 上层需同步 DB 状态/解冻）
 		if matchOrder.TIF == TIFGTD && matchOrder.ExpireAt > 0 && time.Now().UnixMilli() > matchOrder.ExpireAt {
+			matchList.Volume -= matchOrder.Remaining
+			matchList.Count--
 			matchList.Head = matchOrder.Next
 			if matchList.Head == nil {
 				matchList.Tail = nil
@@ -287,8 +293,10 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 
 		order.Remaining -= qty
 		matchOrder.Remaining -= qty
+		matchList.Volume -= qty
 
 		if matchOrder.Remaining == 0 {
+			matchList.Count--
 			matchList.Head = matchOrder.Next
 			if matchList.Head == nil {
 				matchList.Tail = nil
@@ -555,7 +563,17 @@ func (ob *OrderBook) RollbackMatch(rb RollbackData) {
 
 	for id, prevRemaining := range rb.PartialMakers {
 		if o, ok := ob.orders[id]; ok {
+			old := o.Remaining
 			o.Remaining = prevRemaining
+			var list *OrderList
+			if o.Side == Buy {
+				list = ob.bids[o.Price]
+			} else {
+				list = ob.asks[o.Price]
+			}
+			if list != nil {
+				list.Volume += prevRemaining - old
+			}
 		}
 	}
 }
@@ -611,6 +629,8 @@ func (ob *OrderBook) removeFromList(list *OrderList, orderID string) *Order {
 			list.Tail = nil
 		}
 		removed.Next = nil
+		list.Volume -= removed.Remaining
+		list.Count--
 		return removed
 	}
 
@@ -623,6 +643,8 @@ func (ob *OrderBook) removeFromList(list *OrderList, orderID string) *Order {
 				list.Tail = prev
 			}
 			curr.Next = nil
+			list.Volume -= curr.Remaining
+			list.Count--
 			return curr
 		}
 		prev = curr
@@ -665,16 +687,10 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 		if list == nil || list.Head == nil {
 			continue
 		}
-		amount := int64(0)
-		count := 0
-		for order := list.Head; order != nil; order = order.Next {
-			amount += order.Remaining
-			count++
-		}
 		depth.Bids = append(depth.Bids, DepthLevel{
 			Price:      node.Price,
-			Amount:     amount,
-			OrderCount: count,
+			Amount:     list.Volume,
+			OrderCount: list.Count,
 		})
 	}
 
@@ -686,16 +702,10 @@ func (ob *OrderBook) GetDepth(symbol string, limit int) Depth {
 		if list == nil || list.Head == nil {
 			continue
 		}
-		amount := int64(0)
-		count := 0
-		for order := list.Head; order != nil; order = order.Next {
-			amount += order.Remaining
-			count++
-		}
 		depth.Asks = append(depth.Asks, DepthLevel{
 			Price:      node.Price,
-			Amount:     amount,
-			OrderCount: count,
+			Amount:     list.Volume,
+			OrderCount: list.Count,
 		})
 	}
 

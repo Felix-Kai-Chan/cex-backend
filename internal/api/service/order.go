@@ -244,7 +244,21 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	baseAsset := getBaseAsset(req.Symbol)
 	quoteAsset := getQuoteAsset(req.Symbol)
 
-	// 6. 冻结
+	// 6. 创建订单对象（冻结与落库在同一事务中完成）
+	order := &engine.Order{
+		ID:        fmt.Sprintf("%s_%d", req.UserID, time.Now().UnixNano()),
+		UserID:    req.UserID,
+		Side:      side,
+		Type:      orderType,
+		TIF:       tif,
+		ExpireAt:  req.ExpireAt,
+		Price:     price,
+		Amount:    req.Amount,
+		Remaining: req.Amount,
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	// 7. 冻结
 	var freezeAmount float64
 	var freezeAsset string
 
@@ -281,27 +295,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		freezeAmount = float64(req.Amount)
 	}
 
-	if err := s.balanceRepo.FreezeBalance(req.UserID, freezeAsset, freezeAmount); err != nil {
-		return nil, fmt.Errorf("冻结余额失败: %w", err)
-	}
-
-	// 7. 创建订单
-	order := &engine.Order{
-		ID:        fmt.Sprintf("%s_%d", req.UserID, time.Now().UnixNano()),
-		UserID:    req.UserID,
-		Side:      side,
-		Type:      orderType,
-		TIF:       tif,
-		ExpireAt:  req.ExpireAt,
-		Price:     price,
-		Amount:    req.Amount,
-		Remaining: req.Amount,
-		Timestamp: time.Now().UnixMilli(),
-	}
-
-	// 7.1 同事务写 order + outbox
-	if err := s.saveOrderWithOutbox(order, req, orderType, tif); err != nil {
-		_ = s.balanceRepo.UnfreezeBalance(req.UserID, freezeAsset, freezeAmount)
+	if err := s.freezeAndSaveOrderWithOutbox(order, req, orderType, tif, freezeAsset, freezeAmount); err != nil {
 		return nil, fmt.Errorf("订单创建失败: %w", err)
 	}
 
@@ -353,150 +347,154 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		status = persistence.OrderStatusPartiallyFilled
 	}
 
-	settleErr := func() error {
-		tx := s.db.Begin()
-		if tx.Error != nil {
-			return tx.Error
-		}
-		defer func() {
-			if r := recover(); r != nil {
-				tx.Rollback()
-				panic(r)
+	var settleErr error
+	// 纯挂单且无成交、无状态变化时，订单已由 freezeAndSaveOrderWithOutbox 写入，跳过重复结算事务
+	if len(trades) > 0 || order.Remaining != order.Amount || status != persistence.OrderStatusNew {
+		settleErr = retryDBTransaction(3, func() error {
+			tx := s.db.Begin()
+			if tx.Error != nil {
+				return tx.Error
 			}
-		}()
-
-		for _, trade := range trades {
-			if err := s.repo.SaveTradeTx(tx, trade.TradeID, trade.BuyOrder, trade.SellOrder, trade.Price, trade.Quantity, trade.Timestamp); err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			tradeAmount := float64(trade.Price * trade.Quantity)
-			tradeQty := float64(trade.Quantity)
-
-			if err := s.balanceRepo.DeductFrozenTx(tx, trade.BuyUserID, quoteAsset, tradeAmount); err != nil {
-				tx.Rollback()
-				return err
-			}
-			if err := s.balanceRepo.AddBalanceTx(tx, trade.BuyUserID, baseAsset, tradeQty); err != nil {
-				tx.Rollback()
-				return err
-			}
-			if err := s.balanceRepo.DeductFrozenTx(tx, trade.SellUserID, baseAsset, tradeQty); err != nil {
-				tx.Rollback()
-				return err
-			}
-			if err := s.balanceRepo.AddBalanceTx(tx, trade.SellUserID, quoteAsset, tradeAmount); err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			// 买家订单状态
-			var buyerOrder persistence.OrderModel
-			if err := tx.Where("order_id = ?", trade.BuyOrder).First(&buyerOrder).Error; err == nil {
-				newRemaining := buyerOrder.Remaining - trade.Quantity
-				buyerStatus := persistence.OrderStatusNew
-				if newRemaining == 0 {
-					buyerStatus = persistence.OrderStatusFilled
-				} else if newRemaining < buyerOrder.Amount {
-					buyerStatus = persistence.OrderStatusPartiallyFilled
+			defer func() {
+				if r := recover(); r != nil {
+					tx.Rollback()
+					panic(r)
 				}
-				if err := s.repo.UpdateOrderTx(tx, trade.BuyOrder, newRemaining, buyerStatus); err != nil {
+			}()
+
+			for _, trade := range trades {
+				if err := s.repo.SaveTradeTx(tx, trade.TradeID, trade.BuyOrder, trade.SellOrder, trade.Price, trade.Quantity, trade.Timestamp); err != nil {
 					tx.Rollback()
 					return err
 				}
-			}
 
-			// 卖家订单状态
-			var sellerOrder persistence.OrderModel
-			if err := tx.Where("order_id = ?", trade.SellOrder).First(&sellerOrder).Error; err == nil {
-				newRemaining := sellerOrder.Remaining - trade.Quantity
-				sellerStatus := persistence.OrderStatusNew
-				if newRemaining == 0 {
-					sellerStatus = persistence.OrderStatusFilled
-				} else if newRemaining < sellerOrder.Amount {
-					sellerStatus = persistence.OrderStatusPartiallyFilled
-				}
-				if err := s.repo.UpdateOrderTx(tx, trade.SellOrder, newRemaining, sellerStatus); err != nil {
+				tradeAmount := float64(trade.Price * trade.Quantity)
+				tradeQty := float64(trade.Quantity)
+
+				if err := s.balanceRepo.DeductFrozenTx(tx, trade.BuyUserID, quoteAsset, tradeAmount); err != nil {
 					tx.Rollback()
 					return err
 				}
-			}
+				if err := s.balanceRepo.AddBalanceTx(tx, trade.BuyUserID, baseAsset, tradeQty); err != nil {
+					tx.Rollback()
+					return err
+				}
+				if err := s.balanceRepo.DeductFrozenTx(tx, trade.SellUserID, baseAsset, tradeQty); err != nil {
+					tx.Rollback()
+					return err
+				}
+				if err := s.balanceRepo.AddBalanceTx(tx, trade.SellUserID, quoteAsset, tradeAmount); err != nil {
+					tx.Rollback()
+					return err
+				}
 
-			_ = s.ledger.RecordTx(tx, trade.BuyUserID, quoteAsset, -tradeAmount, 0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
-				fmt.Sprintf("买入 %d 数量，价格 %d", trade.Quantity, trade.Price))
-			_ = s.ledger.RecordTx(tx, trade.SellUserID, quoteAsset, tradeAmount, 0, 0, "TRADE", trade.SellOrder, trade.TradeID,
-				fmt.Sprintf("卖出 %d 数量，价格 %d", trade.Quantity, trade.Price))
-
-			// 成交事件 Outbox
-			event := mq.OrderEvent{
-				EventID:     fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-				EventType:   mq.EventTradeFilled,
-				OrderID:     trade.BuyOrder,
-				UserID:      trade.BuyUserID,
-				Symbol:      req.Symbol,
-				Side:        "BUY",
-				TradeID:     trade.TradeID,
-				BuyOrder:    trade.BuyOrder,
-				SellOrder:   trade.SellOrder,
-				BuyUserID:   trade.BuyUserID,
-				SellUserID:  trade.SellUserID,
-				Price:       trade.Price,
-				Amount:      trade.Quantity,
-				Status:      "FILLED",
-				Timestamp:   trade.Timestamp,
-			}
-			payload, _ := json.Marshal(event)
-			outboxMsg := &persistence.OutboxModel{
-				AggregateID: trade.TradeID,
-				KafkaKey:    req.Symbol,
-				Topic:       s.kafkaTopic,
-				Payload:     string(payload),
-				Status:      "PENDING",
-			}
-			if err := s.outboxRepo.Create(tx, outboxMsg); err != nil {
-				tx.Rollback()
-				return err
-			}
-		}
-
-		// 当前订单状态
-		if err := s.repo.UpdateOrderTx(tx, order.ID, order.Remaining, status); err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		// 解冻未成交部分（事务内）
-		if order.Remaining > 0 {
-			shouldUnfreeze := false
-			if order.TIF == engine.TIFIOC || order.TIF == engine.TIFFOK {
-				shouldUnfreeze = true
-			} else if orderType == engine.TypeMarket {
-				shouldUnfreeze = true
-			}
-
-			if shouldUnfreeze {
-				var unfreezeAmount float64
-				var unfreezeAsset string
-				if side == engine.Buy {
-					unfreezeAsset = quoteAsset
-					unfreezeAmount = freezeAmount - orderSpentQuote
-					if unfreezeAmount < 0 {
-						unfreezeAmount = 0
+				// 买家订单状态
+				var buyerOrder persistence.OrderModel
+				if err := tx.Where("order_id = ?", trade.BuyOrder).First(&buyerOrder).Error; err == nil {
+					newRemaining := buyerOrder.Remaining - trade.Quantity
+					buyerStatus := persistence.OrderStatusNew
+					if newRemaining == 0 {
+						buyerStatus = persistence.OrderStatusFilled
+					} else if newRemaining < buyerOrder.Amount {
+						buyerStatus = persistence.OrderStatusPartiallyFilled
 					}
-				} else {
-					unfreezeAsset = baseAsset
-					unfreezeAmount = float64(order.Remaining)
+					if err := s.repo.UpdateOrderTx(tx, trade.BuyOrder, newRemaining, buyerStatus); err != nil {
+						tx.Rollback()
+						return err
+					}
 				}
-				if err := s.balanceRepo.UnfreezeBalanceTx(tx, order.UserID, unfreezeAsset, unfreezeAmount); err != nil {
+
+				// 卖家订单状态
+				var sellerOrder persistence.OrderModel
+				if err := tx.Where("order_id = ?", trade.SellOrder).First(&sellerOrder).Error; err == nil {
+					newRemaining := sellerOrder.Remaining - trade.Quantity
+					sellerStatus := persistence.OrderStatusNew
+					if newRemaining == 0 {
+						sellerStatus = persistence.OrderStatusFilled
+					} else if newRemaining < sellerOrder.Amount {
+						sellerStatus = persistence.OrderStatusPartiallyFilled
+					}
+					if err := s.repo.UpdateOrderTx(tx, trade.SellOrder, newRemaining, sellerStatus); err != nil {
+						tx.Rollback()
+						return err
+					}
+				}
+
+				_ = s.ledger.RecordTx(tx, trade.BuyUserID, quoteAsset, -tradeAmount, 0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
+					fmt.Sprintf("买入 %d 数量，价格 %d", trade.Quantity, trade.Price))
+				_ = s.ledger.RecordTx(tx, trade.SellUserID, quoteAsset, tradeAmount, 0, 0, "TRADE", trade.SellOrder, trade.TradeID,
+					fmt.Sprintf("卖出 %d 数量，价格 %d", trade.Quantity, trade.Price))
+
+				// 成交事件 Outbox
+				event := mq.OrderEvent{
+					EventID:    fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+					EventType:  mq.EventTradeFilled,
+					OrderID:    trade.BuyOrder,
+					UserID:     trade.BuyUserID,
+					Symbol:     req.Symbol,
+					Side:       "BUY",
+					TradeID:    trade.TradeID,
+					BuyOrder:   trade.BuyOrder,
+					SellOrder:  trade.SellOrder,
+					BuyUserID:  trade.BuyUserID,
+					SellUserID: trade.SellUserID,
+					Price:      trade.Price,
+					Amount:     trade.Quantity,
+					Status:     "FILLED",
+					Timestamp:  trade.Timestamp,
+				}
+				payload, _ := json.Marshal(event)
+				outboxMsg := &persistence.OutboxModel{
+					AggregateID: trade.TradeID,
+					KafkaKey:    req.Symbol,
+					Topic:       s.kafkaTopic,
+					Payload:     string(payload),
+					Status:      "PENDING",
+				}
+				if err := s.outboxRepo.Create(tx, outboxMsg); err != nil {
 					tx.Rollback()
 					return err
 				}
 			}
-		}
 
-		return tx.Commit().Error
-	}()
+			// 当前订单状态
+			if err := s.repo.UpdateOrderTx(tx, order.ID, order.Remaining, status); err != nil {
+				tx.Rollback()
+				return err
+			}
+
+			// 解冻未成交部分（事务内）
+			if order.Remaining > 0 {
+				shouldUnfreeze := false
+				if order.TIF == engine.TIFIOC || order.TIF == engine.TIFFOK {
+					shouldUnfreeze = true
+				} else if orderType == engine.TypeMarket {
+					shouldUnfreeze = true
+				}
+
+				if shouldUnfreeze {
+					var unfreezeAmount float64
+					var unfreezeAsset string
+					if side == engine.Buy {
+						unfreezeAsset = quoteAsset
+						unfreezeAmount = freezeAmount - orderSpentQuote
+						if unfreezeAmount < 0 {
+							unfreezeAmount = 0
+						}
+					} else {
+						unfreezeAsset = baseAsset
+						unfreezeAmount = float64(order.Remaining)
+					}
+					if err := s.balanceRepo.UnfreezeBalanceTx(tx, order.UserID, unfreezeAsset, unfreezeAmount); err != nil {
+						tx.Rollback()
+						return err
+					}
+				}
+			}
+
+			return tx.Commit().Error
+		})
+	}
 
 	if settleErr != nil {
 		// 逆向恢复内存订单簿
@@ -549,7 +547,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}, nil
 }
 
-func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrderRequest, orderType engine.OrderType, tif engine.TimeInForce) error {
+func (s *OrderService) freezeAndSaveOrderWithOutbox(order *engine.Order, req *CreateOrderRequest, orderType engine.OrderType, tif engine.TimeInForce, freezeAsset string, freezeAmount float64) error {
 	tx := s.db.Begin()
 	if tx.Error != nil {
 		return tx.Error
@@ -560,6 +558,11 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 			panic(r)
 		}
 	}()
+
+	if err := s.balanceRepo.FreezeBalanceTx(tx, order.UserID, freezeAsset, freezeAmount); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("冻结余额失败: %w", err)
+	}
 
 	if err := s.repo.SaveOrderTx(tx, order.ID, order.UserID, req.Symbol, req.Side, string(orderType), string(tif), order.Price, order.Amount, order.Remaining, order.ExpireAt, persistence.OrderStatusNew); err != nil {
 		tx.Rollback()
@@ -589,7 +592,7 @@ func (s *OrderService) saveOrderWithOutbox(order *engine.Order, req *CreateOrder
 
 	outboxMsg := &persistence.OutboxModel{
 		AggregateID: order.ID,
-		KafkaKey:    req.Symbol, // ✅ 加上
+		KafkaKey:    req.Symbol,
 		Topic:       s.kafkaTopic,
 		Payload:     string(payload),
 		Status:      "PENDING",
@@ -755,4 +758,37 @@ func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, p
 		return
 	}
 	tx.Commit()
+}
+
+// retryDBTransaction 对可重试的数据库错误进行有限次重试
+func retryDBTransaction(attempts int, fn func() error) error {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if !isRetryableDBError(err) {
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 50 * time.Millisecond)
+	}
+	return err
+}
+
+func isRetryableDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1040") ||
+		strings.Contains(msg, "too many connections") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "bad connection") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "deadlock") ||
+		strings.Contains(msg, "lock wait timeout")
 }

@@ -23,10 +23,10 @@ func InitDB(dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB.SetMaxOpenConns(500)                 // 最大打开连接数
-	sqlDB.SetMaxIdleConns(100)                 // 最大空闲连接数
-	sqlDB.SetConnMaxLifetime(30 * time.Minute) // 连接最大存活时间
-	sqlDB.SetConnMaxIdleTime(10 * time.Minute) // 连接最大空闲时间
+	sqlDB.SetMaxOpenConns(100)                // 最大打开连接数（300 并发压测下避免打爆 MySQL）
+	sqlDB.SetMaxIdleConns(50)                 // 最大空闲连接数
+	sqlDB.SetConnMaxLifetime(5 * time.Minute) // 连接最大存活时间，避免长期占用
+	sqlDB.SetConnMaxIdleTime(1 * time.Minute) // 空闲连接回收时间
 
 	// 自动迁移所有表结构
 	if err := db.AutoMigrate(
