@@ -80,10 +80,12 @@ type CreateOrderRequest struct {
 }
 
 type CreateOrderResponse struct {
-	OrderID string          `json:"order_id"`
-	Status  string          `json:"status"`
-	Message string          `json:"message"`
-	Trades  []TradeResponse `json:"trades,omitempty"`
+	OrderID     string          `json:"order_id"`
+	OrderType   string          `json:"order_type"`
+	TimeInForce string          `json:"time_in_force"`
+	Status      string          `json:"status"`
+	Message     string          `json:"message"`
+	Trades      []TradeResponse `json:"trades,omitempty"`
 }
 
 type TradeResponse struct {
@@ -538,10 +540,12 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}
 
 	return &CreateOrderResponse{
-		OrderID: order.ID,
-		Status:  status,
-		Message: fmt.Sprintf("订单已处理，成交 %d 笔", len(trades)),
-		Trades:  tradeResponses,
+		OrderID:     order.ID,
+		OrderType:   string(orderType),
+		TimeInForce: string(tif),
+		Status:      status,
+		Message:     fmt.Sprintf("订单已处理，成交 %d 笔", len(trades)),
+		Trades:      tradeResponses,
 	}, nil
 }
 
