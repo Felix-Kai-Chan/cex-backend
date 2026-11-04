@@ -19,7 +19,8 @@ RUN go mod download
 COPY . .
 
 # 编译（静态链接，无 CGO）
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/cex-api ./cmd/api
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/cex-api ./cmd/api && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/cex-gateway ./cmd/gateway
 
 # ============================================
 # Stage 2：运行
@@ -36,12 +37,13 @@ RUN apk add --no-cache ca-certificates tzdata
 
 # 从 builder 复制二进制
 COPY --from=builder /app/cex-api /app/cex-api
+COPY --from=builder /app/cex-gateway /app/cex-gateway
 
 # 设置时区
 ENV TZ=Asia/Shanghai
 
 # 暴露端口
-EXPOSE 8080
+EXPOSE 8080 8081
 
 # 启动
 CMD ["/app/cex-api"]

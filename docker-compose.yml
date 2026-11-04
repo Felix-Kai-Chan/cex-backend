@@ -87,7 +87,7 @@ services:
     container_name: cex-api
     restart: always
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       MYSQL_DSN: "root:root@tcp(mysql:3306)/cex?charset=utf8mb4&parseTime=True&loc=Local"
       REDIS_ADDR: "redis:6379"
@@ -104,6 +104,45 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+    networks:
+      - cex-network
+
+
+  # ============================================
+  # API Gateway（限流 + 反向代理）
+  # ============================================
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cex-gateway
+    restart: always
+    command: ["/app/cex-gateway"]
+    ports:
+      - "8081:8081"
+    environment:
+      GATEWAY_PORT: "8081"
+      BACKEND_URL: "http://cex-api:8080"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      RATE_LIMIT_RATE: "50"
+      RATE_LIMIT_BURST: "100"
+      RATE_LIMIT_FAIL_OPEN: "false"
+      RATE_LIMIT_LOCAL_FALLBACK: "true"
+      TRUST_PROXY: "false"
+      TZ: Asia/Shanghai
+    depends_on:
+      cex-api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     networks:
       - cex-network
 
