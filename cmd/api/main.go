@@ -138,6 +138,7 @@ func main() {
 	api := r.Group("/api/v1")
 	{
 		api.POST("/orders", orderHandler.CreateOrder)
+		api.GET("/orders", orderHandler.GetOrders)
 		api.GET("/orders/:id", orderHandler.GetOrder)
 		api.GET("/orders/user/:user_id", orderHandler.GetOrdersByUser)
 		api.DELETE("/orders/:id", orderHandler.CancelOrder)
@@ -147,6 +148,8 @@ func main() {
 		api.POST("/balance/deduct", balanceHandler.DeductBalance)
 
 		api.GET("/depth", depthHandler.GetDepth)
+
+		api.GET("/trades", orderHandler.GetTrades)
 
 		api.GET("/ledger/:user_id", ledgerHandler.GetLedgerByUser)
 	}

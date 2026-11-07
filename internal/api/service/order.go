@@ -618,6 +618,14 @@ func (s *OrderService) GetOrdersByUser(userID string) ([]persistence.OrderModel,
 	return s.repo.GetOrdersByUser(userID)
 }
 
+func (s *OrderService) GetOrdersByUserAndStatuses(userID string, statuses []string, limit int) ([]persistence.OrderModel, error) {
+	return s.repo.GetOrdersByUserAndStatuses(userID, statuses, limit)
+}
+
+func (s *OrderService) GetTradesByUser(userID string, limit int) ([]persistence.TradeHistory, error) {
+	return s.repo.GetTradesByUser(userID, limit)
+}
+
 func (s *OrderService) CancelOrder(orderID, userID string) error {
 	var order persistence.OrderModel
 	if err := s.repo.GetOrderByID(orderID, &order); err != nil {
