@@ -38,6 +38,7 @@ RUN apk add --no-cache ca-certificates tzdata
 # 从 builder 复制二进制
 COPY --from=builder /app/cex-api /app/cex-api
 COPY --from=builder /app/cex-gateway /app/cex-gateway
+COPY --from=builder /app/web /app/web
 
 # 设置时区
 ENV TZ=Asia/Shanghai

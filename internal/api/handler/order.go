@@ -6,6 +6,16 @@ import (
 	"cex-backend/internal/api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var orderCreatedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "cex_orders_created_total",
+		Help: "Total number of order creation attempts by result.",
+	},
+	[]string{"status"},
 )
 
 type OrderHandler struct {
@@ -22,16 +32,19 @@ func NewOrderHandler(orderService *service.OrderService) *OrderHandler {
 func (h *OrderHandler) CreateOrder(c *gin.Context) {
 	var req service.CreateOrderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		orderCreatedTotal.WithLabelValues("failure").Inc()
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
 		return
 	}
 
 	resp, err := h.orderService.CreateOrder(&req)
 	if err != nil {
+		orderCreatedTotal.WithLabelValues("failure").Inc()
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	orderCreatedTotal.WithLabelValues("success").Inc()
 	c.JSON(http.StatusOK, resp)
 }
 

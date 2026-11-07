@@ -15,6 +15,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	gorillaWS "github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -81,14 +84,18 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(PrometheusMiddleware())
 	r.Use(RequestLogger())
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	// ✅ 监控指标接口
-	r.GET("/metrics", func(c *gin.Context) {
+	// Prometheus 指标接口
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// 原有撮合/熔断指标（JSON 形式）
+	r.GET("/metrics/json", func(c *gin.Context) {
 		metricsSnap := eng.GetMetrics().Snapshot()
 		breakerStatus := eng.GetBreakerStatus()
 
@@ -124,8 +131,9 @@ func main() {
 	})
 
 	r.GET("/", func(c *gin.Context) {
-		c.String(200, "CEX API 运行中")
+		c.File(getEnv("WEB_INDEX", "./web/index.html"))
 	})
+	r.Static("/web", "./web")
 
 	api := r.Group("/api/v1")
 	{
@@ -180,4 +188,53 @@ func getEnvInt(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+var (
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cex_http_requests_total",
+			Help: "Total number of HTTP requests handled by the API.",
+		},
+		[]string{"method", "path", "status"},
+	)
+
+	httpRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "cex_http_request_duration_seconds",
+			Help:    "HTTP request latency in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+)
+
+func PrometheusMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.Path == "/metrics" {
+			c.Next()
+			return
+		}
+
+		start := time.Now()
+		c.Next()
+
+		path := c.FullPath()
+		if path == "" {
+			path = c.Request.URL.Path
+		}
+		if path == "" {
+			path = "unknown"
+		}
+
+		httpRequestsTotal.WithLabelValues(
+			c.Request.Method,
+			path,
+			strconv.Itoa(c.Writer.Status()),
+		).Inc()
+		httpRequestDuration.WithLabelValues(
+			c.Request.Method,
+			path,
+		).Observe(time.Since(start).Seconds())
+	}
 }

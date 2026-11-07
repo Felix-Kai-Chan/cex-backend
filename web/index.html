@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CEX Demo</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #131a26;
+      --panel-2: #1a2332;
+      --border: #263349;
+      --text: #e6edf7;
+      --muted: #8b9bb4;
+      --green: #2ecc71;
+      --red: #ff5c5c;
+      --blue: #4da3ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(1200px 600px at 20% -10%, #16233a 0%, var(--bg) 55%);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 20px 28px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(11, 15, 23, 0.8);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    header h1 {
+      font-size: 18px;
+      margin: 0;
+      letter-spacing: 0.5px;
+    }
+
+    header .tag {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      grid-template-columns: 1fr 1.1fr;
+      gap: 20px;
+    }
+
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .panel h2 {
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin: 0 0 14px;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .row > * { flex: 1; }
+
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    input, select {
+      width: 100%;
+      background: #0d131d;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+    }
+
+    input:focus, select:focus { border-color: var(--blue); }
+
+    button {
+      background: var(--blue);
+      color: #06101d;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.1s ease, opacity 0.2s ease;
+    }
+
+    button:hover { opacity: 0.9; }
+    button:active { transform: translateY(1px); }
+    button.secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .balances {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .balance-card {
+      background: #0d131d;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+
+    .balance-card .asset {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .balance-card .value {
+      font-size: 22px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .balance-card .sub {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .depth-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .depth-grid h3 {
+      font-size: 12px;
+      margin: 0 0 8px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    th, td {
+      text-align: right;
+      padding: 6px 4px;
+      border-bottom: 1px solid rgba(38, 51, 73, 0.6);
+    }
+
+    th:first-child, td:first-child { text-align: left; }
+
+    th {
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 11px;
+    }
+
+    .bid { color: var(--green); }
+    .ask { color: var(--red); }
+
+    .status {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #0d131d;
+      border: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .status.ok { border-color: rgba(46, 204, 113, 0.5); color: var(--green); }
+    .status.err { border-color: rgba(255, 92, 92, 0.5); color: var(--red); }
+
+    .hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+
+    .order-form {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .order-form .full { grid-column: 1 / -1; }
+
+    .side-toggle {
+      display: flex;
+      gap: 8px;
+    }
+
+    .side-toggle button {
+      flex: 1;
+      background: #0d131d;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+
+    .side-toggle button.active-buy {
+      border-color: var(--green);
+      color: var(--green);
+      background: rgba(46, 204, 113, 0.1);
+    }
+
+    .side-toggle button.active-sell {
+      border-color: var(--red);
+      color: var(--red);
+      background: rgba(255, 92, 92, 0.1);
+    }
+
+    .footer {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 24px 28px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>CEX Demo</h1>
+      <div class="tag">纯 HTML / JS · 无构建工具</div>
+    </div>
+    <div class="row" style="flex: 0 0 auto;">
+      <span class="tag" id="conn">连接中...</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>账户</h2>
+
+      <div class="row" style="margin-bottom: 14px;">
+        <div style="flex: 2;">
+          <label for="user">用户 ID</label>
+          <input id="user" value="demo_user" autocomplete="off" />
+        </div>
+        <div style="flex: 1;">
+          <label for="symbol">交易对</label>
+          <select id="symbol">
+            <option value="BTC/USDT" selected>BTC/USDT</option>
+            <option value="ETH/USDT">ETH/USDT</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="balances">
+        <div class="balance-card">
+          <div class="asset">USDT</div>
+          <div class="value" id="usdt-available">0</div>
+          <div class="sub">冻结: <span id="usdt-frozen">0</span></div>
+        </div>
+        <div class="balance-card">
+          <div class="asset">BTC</div>
+          <div class="value" id="btc-available">0</div>
+          <div class="sub">冻结: <span id="btc-frozen">0</span></div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-bottom: 18px;">
+        <button class="secondary" id="refresh">刷新余额</button>
+        <button class="secondary" id="seed">初始化演示账户</button>
+      </div>
+
+      <h2>下单</h2>
+      <form id="order-form" class="order-form">
+        <div class="full">
+          <label>方向</label>
+          <div class="side-toggle">
+            <button type="button" id="side-buy" class="active-buy">买入</button>
+            <button type="button" id="side-sell">卖出</button>
+          </div>
+        </div>
+
+        <div>
+          <label for="price">价格 (USDT)</label>
+          <input id="price" type="number" min="1" step="1" value="50000" />
+        </div>
+
+        <div>
+          <label for="amount">数量</label>
+          <input id="amount" type="number" min="1" step="1" value="1" />
+        </div>
+
+        <div class="full">
+          <button type="submit" style="width: 100%;">提交 LIMIT / GTC 订单</button>
+        </div>
+      </form>
+
+      <div class="hint">
+        演示账户会获得 1,000,000 USDT 和 10 BTC。买单挂 40000、卖单挂 50000 可以看到双边深度。
+      </div>
+
+      <div id="status" class="status">等待操作...</div>
+    </section>
+
+    <section class="panel">
+      <h2>订单簿深度</h2>
+
+      <div class="depth-grid">
+        <div>
+          <h3>Bids 买盘</h3>
+          <table>
+            <thead>
+              <tr><th>价格</th><th>数量</th><th>订单</th></tr>
+            </thead>
+            <tbody id="bids">
+              <tr><td colspan="3" style="text-align:center;color:#8b9bb4;">暂无数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div>
+          <h3>Asks 卖盘</h3>
+          <table>
+            <thead>
+              <tr><th>价格</th><th>数量</th><th>订单</th></tr>
+            </thead>
+            <tbody id="asks">
+              <tr><td colspan="3" style="text-align:center;color:#8b9bb4;">暂无数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="hint" id="depth-updated">深度每 1 秒自动刷新。</div>
+    </section>
+  </main>
+
+  <div class="footer">
+    API: 同源 <code>/api/v1</code> · 指标: <code>/metrics</code>
+  </div>
+
+  <script>
+    const state = {
+      user: document.getElementById('user').value.trim() || 'demo_user',
+      symbol: document.getElementById('symbol').value,
+      side: 'BUY',
+    };
+
+    const el = {
+      user: document.getElementById('user'),
+      symbol: document.getElementById('symbol'),
+      usdtAvailable: document.getElementById('usdt-available'),
+      usdtFrozen: document.getElementById('usdt-frozen'),
+      btcAvailable: document.getElementById('btc-available'),
+      btcFrozen: document.getElementById('btc-frozen'),
+      bids: document.getElementById('bids'),
+      asks: document.getElementById('asks'),
+      status: document.getElementById('status'),
+      conn: document.getElementById('conn'),
+      depthUpdated: document.getElementById('depth-updated'),
+      sideBuy: document.getElementById('side-buy'),
+      sideSell: document.getElementById('side-sell'),
+      price: document.getElementById('price'),
+      amount: document.getElementById('amount'),
+    };
+
+    function setStatus(message, kind = '') {
+      el.status.textContent = message;
+      el.status.className = 'status' + (kind ? ' ' + kind : '');
+    }
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        ...options,
+      });
+      const text = await res.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+      if (!res.ok) {
+        throw new Error(data.error || data.raw || `HTTP ${res.status}`);
+      }
+      return data;
+    }
+
+    function fmt(n) {
+      const num = Number(n || 0);
+      return num.toLocaleString('en-US', { maximumFractionDigits: 4 });
+    }
+
+    async function refreshBalances() {
+      state.user = el.user.value.trim() || 'demo_user';
+      const base = state.symbol.split('/')[0];
+      try {
+        const [usdt, btc] = await Promise.all([
+          api(`/api/v1/balance/${encodeURIComponent(state.user)}/USDT`),
+          api(`/api/v1/balance/${encodeURIComponent(state.user)}/${encodeURIComponent(base)}`),
+        ]);
+        el.usdtAvailable.textContent = fmt(usdt.available);
+        el.usdtFrozen.textContent = fmt(usdt.frozen);
+        el.btcAvailable.textContent = fmt(btc.available);
+        el.btcFrozen.textContent = fmt(btc.frozen);
+      } catch (err) {
+        el.usdtAvailable.textContent = '0';
+        el.usdtFrozen.textContent = '0';
+        el.btcAvailable.textContent = '0';
+        el.btcFrozen.textContent = '0';
+        setStatus(`读取余额失败：${err.message}`, 'err');
+      }
+    }
+
+    async function seedAccount() {
+      state.user = el.user.value.trim() || 'demo_user';
+      try {
+        await api('/api/v1/balance/add', {
+          method: 'POST',
+          body: JSON.stringify({ user_id: state.user, asset: 'USDT', amount: 1000000 }),
+        });
+        await api('/api/v1/balance/add', {
+          method: 'POST',
+          body: JSON.stringify({ user_id: state.user, asset: 'BTC', amount: 10 }),
+        });
+        setStatus(`演示账户 ${state.user} 初始化完成：1,000,000 USDT / 10 BTC`, 'ok');
+        await refreshBalances();
+      } catch (err) {
+        setStatus(`初始化失败：${err.message}`, 'err');
+      }
+    }
+
+    function renderDepth(data) {
+      const render = (rows, tbody, cls) => {
+        if (!rows || rows.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#8b9bb4;">暂无数据</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows.map((row) => `
+          <tr>
+            <td class="${cls}">${fmt(row.price)}</td>
+            <td>${fmt(row.amount)}</td>
+            <td>${row.order_count}</td>
+          </tr>
+        `).join('');
+      };
+
+      render(data.bids, el.bids, 'bid');
+      render(data.asks, el.asks, 'ask');
+      el.depthUpdated.textContent = `深度每 1 秒自动刷新 · 最近更新 ${new Date().toLocaleTimeString()}`;
+    }
+
+    async function refreshDepth() {
+      state.symbol = el.symbol.value;
+      try {
+        const data = await api(`/api/v1/depth?symbol=${encodeURIComponent(state.symbol)}&limit=12`);
+        renderDepth(data);
+        el.conn.textContent = '● 已连接';
+      } catch (err) {
+        el.conn.textContent = '● 连接异常';
+        setStatus(`读取深度失败：${err.message}`, 'err');
+      }
+    }
+
+    function setSide(side) {
+      state.side = side;
+      el.sideBuy.className = side === 'BUY' ? 'active-buy' : '';
+      el.sideSell.className = side === 'SELL' ? 'active-sell' : '';
+    }
+
+    async function submitOrder(event) {
+      event.preventDefault();
+      state.user = el.user.value.trim() || 'demo_user';
+      state.symbol = el.symbol.value;
+
+      const price = Number(el.price.value);
+      const amount = Number(el.amount.value);
+
+      if (!state.user || !price || !amount) {
+        setStatus('请填写用户、价格和数量', 'err');
+        return;
+      }
+
+      setStatus('提交中...');
+      try {
+        const resp = await api('/api/v1/orders', {
+          method: 'POST',
+          body: JSON.stringify({
+            user_id: state.user,
+            symbol: state.symbol,
+            side: state.side,
+            order_type: 'LIMIT',
+            time_in_force: 'GTC',
+            price,
+            amount,
+          }),
+        });
+
+        const trades = resp.trades && resp.trades.length
+          ? `\n成交: ${resp.trades.map((t) => `${t.quantity} @ ${t.price}`).join(', ')}`
+          : '\n成交: 无（已进入订单簿）';
+
+        setStatus(`下单成功\n订单: ${resp.order_id}\n状态: ${resp.status}${trades}`, 'ok');
+        await Promise.all([refreshBalances(), refreshDepth()]);
+      } catch (err) {
+        setStatus(`下单失败：${err.message}`, 'err');
+      }
+    }
+
+    el.sideBuy.addEventListener('click', () => setSide('BUY'));
+    el.sideSell.addEventListener('click', () => setSide('SELL'));
+    document.getElementById('refresh').addEventListener('click', refreshBalances);
+    document.getElementById('seed').addEventListener('click', seedAccount);
+    document.getElementById('order-form').addEventListener('submit', submitOrder);
+    el.user.addEventListener('change', refreshBalances);
+    el.symbol.addEventListener('change', () => {
+      refreshBalances();
+      refreshDepth();
+    });
+
+    refreshBalances();
+    refreshDepth();
+    setInterval(refreshDepth, 1000);
+  </script>
+</body>
+</html>
