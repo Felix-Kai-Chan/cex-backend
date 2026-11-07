@@ -253,6 +253,83 @@
       background: rgba(255, 92, 92, 0.1);
     }
 
+
+    .history-panel {
+      grid-column: 1 / -1;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+
+    .tab {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      padding: 9px 14px;
+      border-radius: 8px 8px 0 0;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .tab.active {
+      color: var(--text);
+      background: rgba(77, 163, 255, 0.1);
+      box-shadow: inset 0 -2px 0 var(--blue);
+    }
+
+    .tab-panel {
+      display: none;
+    }
+
+    .tab-panel.active {
+      display: block;
+    }
+
+    .history-empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 18px 0;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .badge.buy {
+      color: var(--green);
+      border-color: rgba(46, 204, 113, 0.4);
+    }
+
+    .badge.sell {
+      color: var(--red);
+      border-color: rgba(255, 92, 92, 0.4);
+    }
+
+    .badge.status-open {
+      color: var(--blue);
+      border-color: rgba(77, 163, 255, 0.4);
+    }
+
+    .badge.status-filled {
+      color: var(--green);
+      border-color: rgba(46, 204, 113, 0.4);
+    }
+
+    .badge.status-canceled,
+    .badge.status-expired {
+      color: var(--muted);
+    }
+
     .footer {
       max-width: 1180px;
       margin: 0 auto;
@@ -371,6 +448,60 @@
       </div>
 
       <div class="hint" id="depth-updated">深度每 1 秒自动刷新。</div>
+    </section>
+
+    <section class="panel history-panel">
+      <h2>历史订单 / 成交记录</h2>
+
+      <div class="tabs">
+        <button class="tab active" data-tab="open" type="button">当前委托</button>
+        <button class="tab" data-tab="history" type="button">历史订单</button>
+        <button class="tab" data-tab="trades" type="button">成交明细</button>
+      </div>
+
+      <div class="tab-panel active" id="tab-open">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th><th>交易对</th><th>方向</th><th>类型</th>
+              <th>价格</th><th>数量</th><th>剩余</th><th>状态</th>
+            </tr>
+          </thead>
+          <tbody id="open-orders">
+            <tr><td colspan="8" class="history-empty">暂无记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tab-panel" id="tab-history">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th><th>交易对</th><th>方向</th><th>类型</th>
+              <th>价格</th><th>数量</th><th>剩余</th><th>状态</th>
+            </tr>
+          </thead>
+          <tbody id="history-orders">
+            <tr><td colspan="8" class="history-empty">暂无记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tab-panel" id="tab-trades">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th><th>交易对</th><th>方向</th>
+              <th>价格</th><th>数量</th><th>订单 ID</th>
+            </tr>
+          </thead>
+          <tbody id="trade-rows">
+            <tr><td colspan="6" class="history-empty">暂无记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="hint" id="history-updated">每 2 秒自动刷新。</div>
     </section>
   </main>
 
@@ -538,17 +669,132 @@
 
         setStatus(`下单成功\n订单: ${resp.order_id}\n状态: ${resp.status}${trades}`, 'ok');
         await Promise.all([refreshBalances(), refreshDepth()]);
+        await fetchHistory();
       } catch (err) {
         setStatus(`下单失败：${err.message}`, 'err');
       }
     }
 
+
+    const historyEl = {
+      updated: document.getElementById('history-updated'),
+      openOrders: document.getElementById('open-orders'),
+      historyOrders: document.getElementById('history-orders'),
+      tradeRows: document.getElementById('trade-rows'),
+    };
+
+    function fmtTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return '-';
+      return date.toLocaleString();
+    }
+
+    function statusClass(status) {
+      switch (status) {
+        case 'NEW':
+        case 'PARTIALLY_FILLED':
+          return 'status-open';
+        case 'FILLED':
+          return 'status-filled';
+        case 'CANCELED':
+          return 'status-canceled';
+        case 'EXPIRED':
+          return 'status-expired';
+        default:
+          return '';
+      }
+    }
+
+    function renderOrderRows(tbody, rows) {
+      if (!rows || rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" class="history-empty">暂无记录</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = rows.map((o) => {
+        const sideClass = o.side === 'BUY' ? 'buy' : 'sell';
+        const sideText = o.side === 'BUY' ? '买入' : '卖出';
+        return `
+          <tr>
+            <td>${fmtTime(o.created_at)}</td>
+            <td>${o.symbol || '-'}</td>
+            <td><span class="badge ${sideClass}">${sideText}</span></td>
+            <td>${o.order_type || '-'}</td>
+            <td class="${sideClass === 'buy' ? 'bid' : 'ask'}">${fmt(o.price)}</td>
+            <td>${fmt(o.amount)}</td>
+            <td>${fmt(o.remaining)}</td>
+            <td><span class="badge ${statusClass(o.status)}">${o.status}</span></td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderTradeRows(rows) {
+      if (!rows || rows.length === 0) {
+        historyEl.tradeRows.innerHTML = '<tr><td colspan="6" class="history-empty">暂无记录</td></tr>';
+        return;
+      }
+
+      historyEl.tradeRows.innerHTML = rows.map((t) => {
+        const sideClass = t.side === 'BUY' ? 'buy' : 'sell';
+        const sideText = t.side === 'BUY' ? '买入' : '卖出';
+        return `
+          <tr>
+            <td>${fmtTime(t.timestamp)}</td>
+            <td>${t.symbol || '-'}</td>
+            <td><span class="badge ${sideClass}">${sideText}</span></td>
+            <td class="${sideClass === 'buy' ? 'bid' : 'ask'}">${fmt(t.price)}</td>
+            <td>${fmt(t.quantity)}</td>
+            <td title="${t.order_id || ''}">${(t.order_id || '-').slice(0, 16)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function fetchHistory() {
+      const user = el.user.value.trim() || 'demo_user';
+      if (!user) return;
+
+      const query = `user_id=${encodeURIComponent(user)}&limit=50`;
+      try {
+        const [openData, historyData, tradeData] = await Promise.all([
+          api(`/api/v1/orders?${query}&status=NEW,PARTIALLY_FILLED`),
+          api(`/api/v1/orders?${query}&status=FILLED,CANCELED,EXPIRED`),
+          api(`/api/v1/trades?${query}`),
+        ]);
+
+        renderOrderRows(historyEl.openOrders, openData.orders);
+        renderOrderRows(historyEl.historyOrders, historyData.orders);
+        renderTradeRows(tradeData.trades);
+        historyEl.updated.textContent = `每 2 秒自动刷新 · 最近更新 ${new Date().toLocaleTimeString()}`;
+      } catch (err) {
+        historyEl.updated.textContent = `历史数据读取失败：${err.message}`;
+      }
+    }
+
+    document.querySelectorAll('.tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.tab-panel').forEach((p) => {
+          p.classList.toggle('active', p.id === 'tab-' + tab);
+        });
+      });
+    });
+
     el.sideBuy.addEventListener('click', () => setSide('BUY'));
     el.sideSell.addEventListener('click', () => setSide('SELL'));
-    document.getElementById('refresh').addEventListener('click', refreshBalances);
+    document.getElementById('refresh').addEventListener('click', async () => {
+      await refreshBalances();
+      await fetchHistory();
+    });
     document.getElementById('seed').addEventListener('click', seedAccount);
     document.getElementById('order-form').addEventListener('submit', submitOrder);
-    el.user.addEventListener('change', refreshBalances);
+    el.user.addEventListener('change', async () => {
+      await refreshBalances();
+      await fetchHistory();
+    });
     el.symbol.addEventListener('change', () => {
       refreshBalances();
       refreshDepth();
@@ -556,7 +802,9 @@
 
     refreshBalances();
     refreshDepth();
+    fetchHistory();
     setInterval(refreshDepth, 1000);
+    setInterval(fetchHistory, 2000);
   </script>
 </body>
 </html>
