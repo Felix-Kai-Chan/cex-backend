@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // OrderModel 订单表（历史记录）
@@ -141,9 +142,25 @@ func (r *TradeRepo) GetTradesByOrder(orderID string) ([]TradeModel, error) {
 	return trades, err
 }
 
+// GetTradesByOrderTx 在指定事务内查询某个订单的所有成交记录。
+func (r *TradeRepo) GetTradesByOrderTx(tx *gorm.DB, orderID string) ([]TradeModel, error) {
+	var trades []TradeModel
+	err := tx.Where("buy_order_id = ? OR sell_order_id = ?", orderID, orderID).
+		Order("timestamp DESC").
+		Find(&trades).Error
+	return trades, err
+}
+
 // GetOrderByID 根据订单 ID 查询
 func (r *TradeRepo) GetOrderByID(orderID string, order *OrderModel) error {
 	return r.db.Where("order_id = ?", orderID).First(order).Error
+}
+
+// GetOrderByIDForUpdateTx 在事务内以 SELECT ... FOR UPDATE 读取订单。
+func (r *TradeRepo) GetOrderByIDForUpdateTx(tx *gorm.DB, orderID string, order *OrderModel) error {
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("order_id = ?", orderID).
+		First(order).Error
 }
 
 // GetOrdersByUser 查询用户的所有订单
@@ -161,6 +178,17 @@ func (r *TradeRepo) CancelOrder(orderID string) error {
 			"status":     OrderStatusCanceled,
 			"updated_at": time.Now(),
 		}).Error
+}
+
+// CancelOrderTx 在事务内条件撤销订单，并返回实际更新的行数。
+func (r *TradeRepo) CancelOrderTx(tx *gorm.DB, orderID string) (int64, error) {
+	result := tx.Model(&OrderModel{}).
+		Where("order_id = ? AND status IN ?", orderID, []string{OrderStatusNew, OrderStatusPartiallyFilled}).
+		Updates(map[string]interface{}{
+			"status":     OrderStatusCanceled,
+			"updated_at": time.Now(),
+		})
+	return result.RowsAffected, result.Error
 }
 
 // SaveOrderTx 在指定事务内保存订单

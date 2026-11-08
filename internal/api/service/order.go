@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -268,7 +269,7 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	ob.LockTrading()
 	defer ob.UnlockTrading()
 
-	if err := snapshotter.WALError(); err != nil {
+	if err := snapshotter.TradingError(); err != nil {
 		return nil, fmt.Errorf("交易对 %s 已暂停交易: %w", req.Symbol, err)
 	}
 
@@ -626,23 +627,16 @@ func (s *OrderService) GetTradesByUser(userID string, limit int) ([]persistence.
 }
 
 func (s *OrderService) CancelOrder(orderID, userID string) error {
-	var order persistence.OrderModel
-	if err := s.repo.GetOrderByID(orderID, &order); err != nil {
+	// 锁外只做定位，后续所有状态和资金计算必须使用 tradeMu + 行锁内重新读取的订单。
+	var located persistence.OrderModel
+	if err := s.repo.GetOrderByID(orderID, &located); err != nil {
 		return fmt.Errorf("订单不存在")
 	}
-
-	if order.UserID != userID {
+	if located.UserID != userID {
 		return fmt.Errorf("无权撤销此订单")
 	}
 
-	if order.Status == persistence.OrderStatusFilled {
-		return fmt.Errorf("订单已成交，无法撤销")
-	}
-	if order.Status == persistence.OrderStatusCanceled {
-		return fmt.Errorf("订单已撤销")
-	}
-
-	symbol := order.Symbol
+	symbol := located.Symbol
 	if symbol == "" {
 		symbol = "BTC/USDT"
 	}
@@ -652,132 +646,193 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	if snapshotter == nil {
 		return fmt.Errorf("交易对 %s 的 WAL 未初始化，拒绝撤单", symbol)
 	}
+
 	ob.LockTrading()
 	defer ob.UnlockTrading()
 
-	if err := snapshotter.WALError(); err != nil {
+	if err := snapshotter.TradingError(); err != nil {
 		return fmt.Errorf("交易对 %s 已暂停交易: %w", symbol, err)
 	}
 
-	_, _ = ob.CancelOrder(orderID)
+	tx := s.db.Begin()
+	if tx.Error != nil {
+		return fmt.Errorf("撤单事务启动失败: %w", tx.Error)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
 
-	if err := s.repo.CancelOrder(orderID); err != nil {
-		return err
+	var order persistence.OrderModel
+	if err := s.repo.GetOrderByIDForUpdateTx(tx, orderID, &order); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("订单不存在")
+		}
+		return fmt.Errorf("读取待撤销订单失败: %w", err)
+	}
+	if order.UserID != userID {
+		return fmt.Errorf("无权撤销此订单")
+	}
+	if order.Symbol != symbol {
+		return fmt.Errorf("订单 symbol 不一致: DB=%s, 锁=%s", order.Symbol, symbol)
+	}
+
+	switch order.Status {
+	case persistence.OrderStatusCanceled:
+		// MySQL 已经撤销但内存仍存在，说明内存订单簿与权威状态不一致。
+		// 不能简单当作重复撤单，必须停止该 symbol 的后续交易。
+		if ob.OrderExists(orderID) {
+			failure := fmt.Errorf("订单 %s 在 MySQL 已撤销但内存订单簿仍存在", orderID)
+			snapshotter.MarkSymbolFailure(failure)
+			return fmt.Errorf("交易对 %s 进入故障保护: %w", symbol, failure)
+		}
+		return fmt.Errorf("订单已撤销")
+	case persistence.OrderStatusFilled:
+		if ob.OrderExists(orderID) {
+			failure := fmt.Errorf("订单 %s 在 MySQL 已成交但内存订单簿仍存在", orderID)
+			snapshotter.MarkSymbolFailure(failure)
+			return fmt.Errorf("交易对 %s 进入故障保护: %w", symbol, failure)
+		}
+		return fmt.Errorf("订单已成交，无法撤销")
+	case persistence.OrderStatusNew, persistence.OrderStatusPartiallyFilled:
+	default:
+		return fmt.Errorf("订单状态 %s 不支持撤单", order.Status)
+	}
+
+	if order.Remaining <= 0 {
+		failure := fmt.Errorf("订单 %s 状态为 %s 但剩余数量为 %d", orderID, order.Status, order.Remaining)
+		snapshotter.MarkSymbolFailure(failure)
+		return fmt.Errorf("交易对 %s 进入故障保护: %w", symbol, failure)
+	}
+
+	// 市场单不挂入订单簿，且原始冻结金额没有持久化。
+	// 不使用撤单时市场价重新估算，避免错误解冻。
+	if order.OrderType == "MARKET" {
+		return fmt.Errorf("市场单不在订单簿中，拒绝撤单")
+	}
+
+	if !ob.OrderExists(orderID) {
+		failure := fmt.Errorf("订单 %s 在 MySQL 状态为 %s 但内存订单簿不存在", orderID, order.Status)
+		snapshotter.MarkSymbolFailure(failure)
+		return fmt.Errorf("交易对 %s 进入故障保护: %w", symbol, failure)
+	}
+
+	quoteAsset := getQuoteAsset(symbol)
+	baseAsset := getBaseAsset(symbol)
+
+	var unfreezeAsset string
+	var unfreezeAmount float64
+	if order.Side == "BUY" {
+		unfreezeAsset = quoteAsset
+		// BUY LIMIT 的 Amount 是原始下单数量，撮合只修改 Remaining。
+		// 剩余冻结 = 原始冻结 - 实际成交金额。
+		trades, err := s.repo.GetTradesByOrderTx(tx, orderID)
+		if err != nil {
+			return fmt.Errorf("查询撤单成交记录失败: %w", err)
+		}
+		spent := 0.0
+		for _, trade := range trades {
+			if trade.BuyOrderID == orderID {
+				spent += float64(trade.Price * trade.Quantity)
+			}
+		}
+		unfreezeAmount = float64(order.Price*order.Amount) - spent
+		if unfreezeAmount < 0 {
+			unfreezeAmount = 0
+		}
+	} else if order.Side == "SELL" {
+		unfreezeAsset = baseAsset
+		unfreezeAmount = float64(order.Remaining)
+	} else {
+		return fmt.Errorf("订单方向 %s 不支持撤单", order.Side)
+	}
+
+	rows, err := s.repo.CancelOrderTx(tx, orderID)
+	if err != nil {
+		return fmt.Errorf("撤销订单失败: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("撤销订单失败: 期望更新 1 行，实际更新 %d 行", rows)
+	}
+
+	if unfreezeAmount > 0 {
+		if err := s.balanceRepo.UnfreezeBalanceTx(tx, order.UserID, unfreezeAsset, unfreezeAmount); err != nil {
+			return fmt.Errorf("撤单解冻失败: %w", err)
+		}
+	}
+
+	if err := s.ledger.RecordTx(
+		tx, order.UserID, unfreezeAsset, 0, 0, 0,
+		"UNFREEZE", orderID, "", "撤单解冻",
+	); err != nil {
+		return fmt.Errorf("撤单账务记录失败: %w", err)
+	}
+
+	cancelEvent := mq.OrderEvent{
+		EventID:     fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		EventType:   mq.EventOrderCancelled,
+		OrderID:     orderID,
+		UserID:      order.UserID,
+		Symbol:      symbol,
+		Side:        order.Side,
+		OrderType:   order.OrderType,
+		TimeInForce: order.TimeInForce,
+		ExpireAt:    order.ExpireAt,
+		Price:       order.Price,
+		Amount:      order.Remaining,
+		Status:      persistence.OrderStatusCanceled,
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	payload, err := json.Marshal(cancelEvent)
+	if err != nil {
+		return fmt.Errorf("撤单事件序列化失败: %w", err)
+	}
+	if err := s.outboxRepo.Create(tx, &persistence.OutboxModel{
+		AggregateID: orderID,
+		KafkaKey:    symbol,
+		Topic:       s.kafkaTopic,
+		Payload:     string(payload),
+		Status:      "PENDING",
+	}); err != nil {
+		return fmt.Errorf("撤单 Outbox 写入失败: %w", err)
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		failure := fmt.Errorf("撤单事务提交失败: %w", err)
+		snapshotter.MarkSymbolFailure(failure)
+		return fmt.Errorf("交易对 %s 进入故障保护: %w", symbol, failure)
+	}
+	committed = true
+
+	// 事务已经提交后才删除内存订单。事务失败时内存完全不变，不需要回滚订单簿。
+	if _, err := ob.CancelOrder(orderID); err != nil {
+		failure := fmt.Errorf("撤单事务已提交但内存订单删除失败: %w", err)
+		snapshotter.MarkSymbolFailure(failure)
+		return fmt.Errorf("交易对 %s 进入故障保护: %w", symbol, failure)
 	}
 
 	walErr := snapshotter.AppendWAL(engine.WALEntry{
 		Op:        engine.WALOpRemove,
 		Symbol:    symbol,
 		OrderID:   orderID,
-		UserID:    userID,
+		UserID:    order.UserID,
 		Side:      order.Side,
 		Price:     order.Price,
 		Remaining: 0,
 		Timestamp: time.Now().UnixMilli(),
 	})
-
-	go s.writeCancelOutbox(orderID, userID, symbol, order.Side, order.Price, order.Remaining, order.TimeInForce, order.ExpireAt)
-
-	baseAsset := getBaseAsset(symbol)
-	quoteAsset := getQuoteAsset(symbol)
-
-	var unfreezeAmount float64
-	var unfreezeAsset string
-
-	if order.Side == "BUY" {
-		unfreezeAsset = quoteAsset
-		spent := 0.0
-		if ts, err := s.repo.GetTradesByOrder(orderID); err == nil {
-			for _, t := range ts {
-				if t.BuyOrderID == orderID {
-					spent += float64(t.Price * t.Quantity)
-				}
-			}
-		}
-		freezeInitial := float64(order.Price * order.Amount)
-		if order.Price == 0 {
-			ref := ob.BestAsk()
-			if ref == 0 {
-				ref = ob.BestBid()
-			}
-			freezeInitial = float64(ref * order.Amount)
-		}
-		unfreezeAmount = freezeInitial - spent
-		if unfreezeAmount < 0 {
-			unfreezeAmount = 0
-		}
-	} else {
-		unfreezeAsset = baseAsset
-		unfreezeAmount = float64(order.Remaining)
+	if walErr != nil {
+		return fmt.Errorf("撤单已生效，但 WAL 持久化失败，交易对 %s 已暂停: %w", symbol, walErr)
 	}
-
-	if err := s.balanceRepo.UnfreezeBalance(userID, unfreezeAsset, unfreezeAmount); err != nil {
-		slog.Warn("unfreeze failed",
-			"order_id", orderID,
-			"user_id", userID,
-			"asset", unfreezeAsset,
-			"amount", unfreezeAmount,
-			"error", err,
-		)
-	}
-
-	_ = s.ledger.Record(
-		userID, unfreezeAsset, 0, 0, 0,
-		"UNFREEZE", orderID, "", "撤单解冻",
-	)
 
 	s.hub.BroadcastOrder(map[string]interface{}{
 		"order_id": orderID,
 		"status":   persistence.OrderStatusCanceled,
-		"user_id":  userID,
+		"user_id":  order.UserID,
 	})
-
-	if walErr != nil {
-		return fmt.Errorf("撤单已生效，但 WAL 持久化失败，交易对 %s 已暂停: %w", symbol, walErr)
-	}
 	return nil
-}
-
-func (s *OrderService) writeCancelOutbox(orderID, userID, symbol, side string, price, remaining int64, timeInForce string, expireAt int64) {
-	event := mq.OrderEvent{
-		EventID:     fmt.Sprintf("evt_%d", time.Now().UnixNano()),
-		EventType:   mq.EventOrderCancelled,
-		OrderID:     orderID,
-		UserID:      userID,
-		Symbol:      symbol,
-		Side:        side,
-		OrderType:   "", // unknown on cancel path; keep empty
-		TimeInForce: timeInForce,
-		ExpireAt:    expireAt,
-		Price:       price,
-		Amount:      remaining,
-		Status:      persistence.OrderStatusCanceled,
-		Timestamp:   time.Now().UnixMilli(),
-	}
-	payload, err := json.Marshal(event)
-	if err != nil {
-		slog.Warn("marshal cancel event failed", "error", err)
-		return
-	}
-
-	tx := s.db.Begin()
-	if tx.Error != nil {
-		slog.Warn("begin tx failed", "error", tx.Error)
-		return
-	}
-	msg := &persistence.OutboxModel{
-		AggregateID: orderID,
-		KafkaKey:    symbol, // ✅ 加上
-		Topic:       s.kafkaTopic,
-		Payload:     string(payload),
-		Status:      "PENDING",
-	}
-	if err := s.outboxRepo.Create(tx, msg); err != nil {
-		tx.Rollback()
-		slog.Warn("write cancel outbox failed", "error", err)
-		return
-	}
-	tx.Commit()
 }
 
 // retryDBTransaction 对可重试的数据库错误进行有限次重试

@@ -183,6 +183,9 @@ type Snapshotter struct {
 	walFailureMu sync.RWMutex
 	walFailure   error
 
+	symbolFailureMu sync.RWMutex
+	symbolFailure   error
+
 	autoSaveInterval time.Duration
 	autoSaveStarted  atomic.Bool
 }
@@ -216,7 +219,7 @@ func (s *Snapshotter) Save() error {
 	defer s.snapshotMu.Unlock()
 
 	s.ob.LockTrading()
-	if err := s.walFailureLocked(); err != nil {
+	if err := s.TradingError(); err != nil {
 		s.ob.UnlockTrading()
 		return fmt.Errorf("Snapshot 保存被拒绝: %w", err)
 	}
@@ -373,6 +376,41 @@ func (s *Snapshotter) walFailureLocked() error {
 		return nil
 	}
 	return fmt.Errorf("WAL 已失败: %w", s.walFailure)
+}
+
+// MarkSymbolFailure 将 symbol 标记为不可继续交易。
+// 用于 WAL 之外的严重一致性故障，例如事务提交后内存订单删除失败。
+func (s *Snapshotter) MarkSymbolFailure(err error) {
+	if err == nil {
+		return
+	}
+	s.symbolFailureMu.Lock()
+	defer s.symbolFailureMu.Unlock()
+	if s.symbolFailure == nil {
+		s.symbolFailure = err
+	}
+}
+
+// SymbolFailureError 返回导致 symbol 不可交易的订单簿故障。
+func (s *Snapshotter) SymbolFailureError() error {
+	s.symbolFailureMu.RLock()
+	defer s.symbolFailureMu.RUnlock()
+	if s.symbolFailure == nil {
+		return nil
+	}
+	return fmt.Errorf("订单簿状态故障: %w", s.symbolFailure)
+}
+
+// TradingError 统一返回阻止该 symbol 继续交易的错误。
+// WAL 故障优先返回，其次返回订单簿/内存一致性故障。
+func (s *Snapshotter) TradingError() error {
+	if err := s.WALError(); err != nil {
+		return fmt.Errorf("WAL 已失败: %w", err)
+	}
+	if err := s.SymbolFailureError(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // AppendWAL 追加单条 WAL 操作日志。

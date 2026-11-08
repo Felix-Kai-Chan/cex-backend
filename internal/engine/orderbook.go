@@ -530,6 +530,15 @@ func (ob *OrderBook) getHighestBid() (int64, *OrderList) {
 	return node.Price, node.List
 }
 
+// OrderExists 只读检查订单是否仍在当前订单簿中。
+// 不修改订单、链表、跳表或 FIFO 顺序。
+func (ob *OrderBook) OrderExists(orderID string) bool {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+	_, ok := ob.orders[orderID]
+	return ok
+}
+
 // CancelOrder 从订单簿中移除订单（O(1) 索引定位）
 func (ob *OrderBook) CancelOrder(orderID string) (*Order, error) {
 	ob.mu.Lock()
