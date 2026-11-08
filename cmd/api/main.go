@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,7 +19,44 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
 )
+
+type loadedSnapshotter struct {
+	symbol      string
+	snapshotter *engine.Snapshotter
+}
+
+// recoverSnapshotters 在任何 symbol 恢复失败时返回错误。
+// 调用方只有在返回错误为 nil 时才允许注册 Snapshotter 和启动 AutoSave。
+// 返回 partial 仅用于启动失败后的诊断/测试；main 不会使用它继续启动。
+func recoverSnapshotters(eng *engine.Engine, rdb *redis.Client, db *gorm.DB, symbols []string) ([]loadedSnapshotter, error) {
+	loaded := make([]loadedSnapshotter, 0, len(symbols))
+	for _, symbol := range symbols {
+		ob := eng.GetOrderBook(symbol)
+		snapshotter := engine.NewSnapshotter(rdb, ob, db, symbol)
+
+		if err := snapshotter.Load(); err != nil {
+			return loaded, fmt.Errorf("订单簿恢复失败，拒绝启动: symbol=%s: %w", symbol, err)
+		}
+
+		loaded = append(loaded, loadedSnapshotter{
+			symbol:      symbol,
+			snapshotter: snapshotter,
+		})
+	}
+	return loaded, nil
+}
+
+// startSnapshotters 只在所有 symbol 恢复成功后调用。
+// 注册与自动快照启动必须作为一个整体发生在恢复边界之后。
+func startSnapshotters(eng *engine.Engine, loaded []loadedSnapshotter) {
+	for _, item := range loaded {
+		eng.RegisterSnapshotter(item.symbol, item.snapshotter)
+		item.snapshotter.StartAutoSave()
+	}
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -51,32 +89,15 @@ func main() {
 
 	// 4. 为每个交易对初始化 Snapshotter + 恢复 + 注册
 	symbols := []string{"BTC/USDT", "ETH/USDT"}
-	type loadedSnapshotter struct {
-		symbol      string
-		snapshotter *engine.Snapshotter
-	}
-	loaded := make([]loadedSnapshotter, 0, len(symbols))
 
-	for _, symbol := range symbols {
-		ob := eng.GetOrderBook(symbol)
-		snapshotter := engine.NewSnapshotter(rdb, ob, db, symbol)
-
-		if err := snapshotter.Load(); err != nil {
-			slog.Error("订单簿恢复失败，拒绝启动", "symbol", symbol, "error", err)
-			os.Exit(1)
-		}
-
-		loaded = append(loaded, loadedSnapshotter{
-			symbol:      symbol,
-			snapshotter: snapshotter,
-		})
+	loaded, err := recoverSnapshotters(eng, rdb, db, symbols)
+	if err != nil {
+		slog.Error("订单簿恢复失败，拒绝启动", "error", err)
+		os.Exit(1)
 	}
 
 	// 只有全部交易对恢复成功，才注册并启动自动快照，避免空订单簿覆盖正常数据。
-	for _, item := range loaded {
-		eng.RegisterSnapshotter(item.symbol, item.snapshotter)
-		item.snapshotter.StartAutoSave()
-	}
+	startSnapshotters(eng, loaded)
 
 	// 5. WebSocket Hub
 	hub := websocket.NewHub()

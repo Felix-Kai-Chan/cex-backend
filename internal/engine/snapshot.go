@@ -3,10 +3,13 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -21,6 +24,57 @@ for i = 1, #ARGV do
     redis.call('RPUSH', key, ARGV[i])
 end
 return #ARGV
+`
+
+// snapshotSwitchScript 原子完成：
+// 1. 写入带 WAL 检查点的新 Snapshot；
+// 2. 删除 WAL 中 seq <= 检查点的前缀；
+// 3. 保留 seq > 检查点的新事件。
+//
+// 脚本在 SET 之前完成 WAL 前缀校验，避免校验失败时只写了一半。
+const snapshotSwitchScript = `
+local snapshotKey = KEYS[1]
+local walKey = KEYS[2]
+local snapshotData = ARGV[1]
+local checkpoint = tonumber(ARGV[2])
+
+local n = redis.call('LLEN', walKey)
+local removeCount = 0
+local lastSeq = 0
+local expectedNewSeq = checkpoint + 1
+local seenGreaterThanCheckpoint = false
+
+for i = 1, n do
+    local raw = redis.call('LINDEX', walKey, i - 1)
+    local ok, entry = pcall(cjson.decode, raw)
+    if not ok or type(entry) ~= 'table' or type(entry.seq) ~= 'number' then
+        return redis.error_reply('WAL entry missing seq at position ' .. i)
+    end
+
+    local seq = entry.seq
+    if seq <= lastSeq then
+        return redis.error_reply('WAL sequence not strictly increasing at position ' .. i)
+    end
+    lastSeq = seq
+
+    if seq > checkpoint then
+        if seq ~= expectedNewSeq then
+            return redis.error_reply('WAL sequence gap after checkpoint at position ' .. i)
+        end
+        expectedNewSeq = expectedNewSeq + 1
+        seenGreaterThanCheckpoint = true
+    elseif seenGreaterThanCheckpoint then
+        return redis.error_reply('WAL entries out of order around checkpoint at position ' .. i)
+    else
+        removeCount = removeCount + 1
+    end
+end
+
+redis.call('SET', snapshotKey, snapshotData)
+if removeCount > 0 then
+    redis.call('LTRIM', walKey, removeCount, -1)
+end
+return removeCount
 `
 
 // WALEntry WAL 操作日志条目
@@ -76,6 +130,7 @@ type Snapshot struct {
 	Bids      map[int64][]OrderItem `json:"bids"`
 	Asks      map[int64][]OrderItem `json:"asks"`
 	Timestamp int64                 `json:"timestamp"`
+	WALSeq    uint64                `json:"wal_seq"`
 }
 
 // OrderItem 快照用的订单精简结构
@@ -117,11 +172,19 @@ type Snapshotter struct {
 	stop   chan struct{}
 
 	walMu          sync.Mutex
-	nextSeq        uint64
+	nextSeq        atomic.Uint64
 	walInitialized bool
+	snapshotWALSeq atomic.Uint64
+	snapshotMu     sync.Mutex
+
+	// beforeSnapshotSwitchHook 仅用于测试故障注入；生产路径为 nil。
+	beforeSnapshotSwitchHook func() error
 
 	walFailureMu sync.RWMutex
 	walFailure   error
+
+	autoSaveInterval time.Duration
+	autoSaveStarted  atomic.Bool
 }
 
 // NewSnapshotter 创建快照管理器
@@ -134,34 +197,69 @@ func NewSnapshotter(rdb *redis.Client, ob *OrderBook, db *gorm.DB, symbol string
 		db:     db,
 		symbol: symbol,
 		stop:   make(chan struct{}),
+
+		autoSaveInterval: 5 * time.Second,
 	}
 }
 
-// Save 保存快照到 Redis
-// ✅ 锁内深拷贝，锁外序列化 + 写 Redis（避免锁内 IO）
-// ✅ 快照存成功，内存状态已被覆盖，WAL 可以全清
+// Save 保存快照到 Redis，并原子切换 Snapshot 与 WAL 检查点。
+//
+// 顺序：
+//  1. 持有 per-symbol tradeMu，保证捕获时没有正在进行的撮合/撤单/WAL 追加；
+//  2. 捕获订单簿和 checkpoint = nextSeq-1；
+//  3. 释放 tradeMu，序列化快照（不持有交易锁做 Redis IO）；
+//  4. 用 Lua 原子写入 Snapshot 并删除 WAL 中 seq <= checkpoint 的前缀。
+//
+// 捕获之后产生的新事件 seq 一定大于 checkpoint，会保留在 WAL 中。
 func (s *Snapshotter) Save() error {
-	// 1. 锁内深拷贝
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+
+	s.ob.LockTrading()
+	if err := s.walFailureLocked(); err != nil {
+		s.ob.UnlockTrading()
+		return fmt.Errorf("Snapshot 保存被拒绝: %w", err)
+	}
 	s.ob.mu.RLock()
+	checkpoint := uint64(0)
+	if seq := s.nextSeq.Load(); seq > 0 {
+		checkpoint = seq - 1
+	}
 	snapshot := Snapshot{
 		Bids:      s.convertOrderBook(s.ob.bids),
 		Asks:      s.convertOrderBook(s.ob.asks),
 		Timestamp: time.Now().Unix(),
+		WALSeq:    checkpoint,
 	}
 	s.ob.mu.RUnlock()
+	s.ob.UnlockTrading()
 
-	// 2. 锁外序列化 + 写 Redis
 	data, err := json.Marshal(snapshot)
 	if err != nil {
-		return err
+		return fmt.Errorf("序列化快照失败: %w", err)
+	}
+	if s.beforeSnapshotSwitchHook != nil {
+		if err := s.beforeSnapshotSwitchHook(); err != nil {
+			return err
+		}
 	}
 
-	if err := s.rdb.Set(context.Background(), s.key, data, 0).Err(); err != nil {
-		return err
+	return s.saveSnapshotAtomic(data, checkpoint)
+}
+
+func (s *Snapshotter) saveSnapshotAtomic(data []byte, checkpoint uint64) error {
+	_, err := s.rdb.Eval(
+		context.Background(),
+		snapshotSwitchScript,
+		[]string{s.key, s.walKey},
+		string(data),
+		strconv.FormatUint(checkpoint, 10),
+	).Result()
+	if err != nil {
+		return fmt.Errorf("Snapshot/WAL 原子切换失败: %w", err)
 	}
 
-	// 3. 快照存成功，内存状态已被覆盖，WAL 全部可清
-	s.TruncateWAL()
+	s.snapshotWALSeq.Store(checkpoint)
 	return nil
 }
 
@@ -169,8 +267,9 @@ func (s *Snapshotter) Save() error {
 func (s *Snapshotter) Load() error {
 	data, err := s.rdb.Get(context.Background(), s.key).Bytes()
 	if err != nil {
-		if err == redis.Nil {
+		if errors.Is(err, redis.Nil) {
 			slog.Info("no snapshot, rebuilding from MySQL", "symbol", s.symbol)
+			s.snapshotWALSeq.Store(0)
 			if seqErr := s.initWALSequence(); seqErr != nil {
 				return fmt.Errorf("WAL 序列号恢复失败: %w", seqErr)
 			}
@@ -190,7 +289,9 @@ func (s *Snapshotter) Load() error {
 	s.restoreOrdersLocked(records)
 	s.ob.mu.Unlock()
 
-	slog.Info("snapshot restored", "symbol", s.symbol, "timestamp", snapshot.Timestamp, "orders", len(records))
+	s.snapshotWALSeq.Store(snapshot.WALSeq)
+
+	slog.Info("snapshot restored", "symbol", s.symbol, "timestamp", snapshot.Timestamp, "orders", len(records), "wal_seq", snapshot.WALSeq)
 
 	if err := s.ReplayWAL(); err != nil {
 		return fmt.Errorf("WAL 回放失败: %w", err)
@@ -302,7 +403,7 @@ func (s *Snapshotter) AppendWALBatch(entries []WALEntry) error {
 		}
 	}
 
-	base := s.nextSeq
+	base := s.nextSeq.Load()
 	for i := range entries {
 		entries[i].Seq = base + uint64(i)
 		entries[i].EventID = s.newWALEventID(entries[i].Seq)
@@ -323,7 +424,7 @@ func (s *Snapshotter) AppendWALBatch(entries []WALEntry) error {
 		return err
 	}
 
-	s.nextSeq = base + uint64(len(entries))
+	s.nextSeq.Store(base + uint64(len(entries)))
 	return nil
 }
 
@@ -345,17 +446,32 @@ func (s *Snapshotter) initWALSequenceLocked() error {
 	if err != nil {
 		return err
 	}
+	checkpoint := s.snapshotWALSeq.Load()
 	if len(entries) == 0 {
-		s.nextSeq = 1
+		nextSeq := checkpoint + 1
+		if nextSeq == 0 {
+			nextSeq = 1
+		}
+		if current := s.nextSeq.Load(); current > nextSeq {
+			nextSeq = current
+		}
+		s.nextSeq.Store(nextSeq)
 		s.walInitialized = true
 		return nil
 	}
 
-	parsed, err := s.parseAndValidateWAL(entries)
+	parsed, err := s.parseAndValidateWAL(entries, checkpoint)
 	if err != nil {
 		return err
 	}
-	s.nextSeq = parsed[len(parsed)-1].Seq + 1
+	nextSeq := parsed[len(parsed)-1].Seq + 1
+	if checkpoint+1 > nextSeq {
+		nextSeq = checkpoint + 1
+	}
+	if current := s.nextSeq.Load(); current > nextSeq {
+		nextSeq = current
+	}
+	s.nextSeq.Store(nextSeq)
 	s.walInitialized = true
 	return nil
 }
@@ -376,57 +492,83 @@ func (s *Snapshotter) ReplayWAL() error {
 		return err
 	}
 
+	checkpoint := s.snapshotWALSeq.Load()
 	if len(entries) == 0 {
-		s.nextSeq = 1
+		nextSeq := checkpoint + 1
+		if nextSeq == 0 {
+			nextSeq = 1
+		}
+		if current := s.nextSeq.Load(); current > nextSeq {
+			nextSeq = current
+		}
+		s.nextSeq.Store(nextSeq)
 		s.walInitialized = true
 		s.walMu.Unlock()
-		slog.Info("WAL is empty, no replay needed")
+		slog.Info("WAL is empty, no replay needed", "checkpoint", checkpoint)
 		return nil
 	}
 
-	parsed, err := s.parseAndValidateWAL(entries)
+	parsed, err := s.parseAndValidateWAL(entries, checkpoint)
 	if err != nil {
 		s.walMu.Unlock()
 		return err
 	}
 
-	// 只有整段 WAL 校验通过后才开始修改订单簿，避免校验失败时留下半恢复状态。
-	s.ob.mu.Lock()
-	replayedCount := 0
+	replayEntries := make([]WALEntry, 0, len(parsed))
 	for _, entry := range parsed {
-		applied, applyErr := s.applyWALEntryLocked(entry)
-		if applyErr != nil {
-			s.ob.mu.Unlock()
-			s.walMu.Unlock()
-			return applyErr
-		}
-		if applied {
-			replayedCount++
+		if entry.Seq > checkpoint {
+			replayEntries = append(replayEntries, entry)
 		}
 	}
 
-	if replayedCount > 0 {
-		s.rebuildOrdersIndexLocked()
-		s.rebuildListAggregatesLocked()
-		s.rebuildSkipList()
+	// 只有整段 WAL 校验通过后才开始修改订单簿，避免校验失败时留下半恢复状态。
+	if len(replayEntries) > 0 {
+		s.ob.mu.Lock()
+		replayedCount := 0
+		for _, entry := range replayEntries {
+			applied, applyErr := s.applyWALEntryLocked(entry)
+			if applyErr != nil {
+				s.ob.mu.Unlock()
+				s.walMu.Unlock()
+				return applyErr
+			}
+			if applied {
+				replayedCount++
+			}
+		}
+
+		if replayedCount > 0 {
+			s.rebuildOrdersIndexLocked()
+			s.rebuildListAggregatesLocked()
+			s.rebuildSkipList()
+		}
+		s.ob.mu.Unlock()
 	}
-	s.ob.mu.Unlock()
 
 	nextSeq := parsed[len(parsed)-1].Seq + 1
-	s.nextSeq = nextSeq
+	if checkpoint+1 > nextSeq {
+		nextSeq = checkpoint + 1
+	}
+	if current := s.nextSeq.Load(); current > nextSeq {
+		nextSeq = current
+	}
+	s.nextSeq.Store(nextSeq)
 	s.walInitialized = true
 	s.walMu.Unlock()
 
-	if replayedCount > 0 {
-		slog.Info("WAL replay completed", "count", replayedCount, "next_seq", nextSeq)
-	}
+	slog.Info("WAL replay completed",
+		"replayed", len(replayEntries),
+		"checkpoint", checkpoint,
+		"next_seq", nextSeq,
+	)
 	return nil
 }
 
-func (s *Snapshotter) parseAndValidateWAL(rawEntries []string) ([]WALEntry, error) {
+func (s *Snapshotter) parseAndValidateWAL(rawEntries []string, checkpoint uint64) ([]WALEntry, error) {
 	parsed := make([]WALEntry, 0, len(rawEntries))
 	seenEventIDs := make(map[string]struct{}, len(rawEntries))
-	expectedSeq := uint64(1)
+	expectedReplaySeq := checkpoint + 1
+	var lastSeq uint64
 
 	for i, entryStr := range rawEntries {
 		var entry WALEntry
@@ -436,9 +578,11 @@ func (s *Snapshotter) parseAndValidateWAL(rawEntries []string) ([]WALEntry, erro
 		if entry.Seq == 0 {
 			return nil, fmt.Errorf("WAL 第 %d 条事件缺少序列号", i+1)
 		}
-		if entry.Seq != expectedSeq {
-			return nil, fmt.Errorf("WAL 序列号断层或乱序: 第 %d 条 seq=%d, 期望 seq=%d", i+1, entry.Seq, expectedSeq)
+		if entry.Seq <= lastSeq {
+			return nil, fmt.Errorf("WAL 序列号断层或乱序: 第 %d 条 seq=%d, 上一条 seq=%d", i+1, entry.Seq, lastSeq)
 		}
+		lastSeq = entry.Seq
+
 		if entry.EventID == "" {
 			return nil, fmt.Errorf("WAL 第 %d 条事件缺少 event_id", i+1)
 		}
@@ -455,8 +599,14 @@ func (s *Snapshotter) parseAndValidateWAL(rawEntries []string) ([]WALEntry, erro
 			return nil, fmt.Errorf("WAL 第 %d 条事件 op=%q 不受支持", i+1, entry.Op)
 		}
 
+		if entry.Seq > checkpoint {
+			if entry.Seq != expectedReplaySeq {
+				return nil, fmt.Errorf("WAL 序列号在 Snapshot 检查点之后断层或乱序: 第 %d 条 seq=%d, 期望 seq=%d", i+1, entry.Seq, expectedReplaySeq)
+			}
+			expectedReplaySeq++
+		}
+
 		parsed = append(parsed, entry)
-		expectedSeq++
 	}
 	return parsed, nil
 }
@@ -552,9 +702,9 @@ func (s *Snapshotter) updateOrderRemainingLocked(order *Order, remaining int64) 
 	}
 }
 
-// TruncateWAL 清空 WAL，并开启一个新的 WAL 段（序列号从 1 重新开始）。
-// 调用方必须已经保证对应快照包含清空前订单簿状态；Snapshot 与 WAL 截断的
-// 原子性不属于本次范围。
+// TruncateWAL 清空 WAL，但不重置序列号。
+// 正常的 Snapshot 保存使用 Save 的原子切换，不应调用本方法；
+// 本方法仅保留给运维/测试显式清理 WAL 使用。
 func (s *Snapshotter) TruncateWAL() error {
 	s.walMu.Lock()
 	defer s.walMu.Unlock()
@@ -562,7 +712,6 @@ func (s *Snapshotter) TruncateWAL() error {
 	if err := s.rdb.Del(context.Background(), s.walKey).Err(); err != nil {
 		return err
 	}
-	s.nextSeq = 1
 	s.walInitialized = true
 	return nil
 }
@@ -801,10 +950,20 @@ func (s *Snapshotter) rebuildSkipList() {
 	}
 }
 
+// AutoSaveStarted 报告自动快照是否已经启动；用于启动边界测试和运维诊断。
+func (s *Snapshotter) AutoSaveStarted() bool {
+	return s.autoSaveStarted.Load()
+}
+
 // StartAutoSave 定时自动保存快照
 func (s *Snapshotter) StartAutoSave() {
+	s.autoSaveStarted.Store(true)
+	interval := s.autoSaveInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for {

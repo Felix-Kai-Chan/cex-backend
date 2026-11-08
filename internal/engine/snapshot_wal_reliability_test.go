@@ -291,8 +291,8 @@ func TestWALReplayAddUpdateRemoveSequence(t *testing.T) {
 	if ob.BestAsk() != 0 || ob.BestBid() != 0 {
 		t.Fatalf("best prices after ADD/UPDATE/REMOVE = %d/%d, want 0/0", ob.BestBid(), ob.BestAsk())
 	}
-	if s.nextSeq != 4 || !s.walInitialized {
-		t.Fatalf("next sequence = %d initialized=%v, want 4/true", s.nextSeq, s.walInitialized)
+	if s.nextSeq.Load() != 4 || !s.walInitialized {
+		t.Fatalf("next sequence = %d initialized=%v, want 4/true", s.nextSeq.Load(), s.walInitialized)
 	}
 }
 

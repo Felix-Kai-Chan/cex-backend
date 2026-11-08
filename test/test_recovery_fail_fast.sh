@@ -19,7 +19,9 @@ redis_cli() {
 
 cleanup() {
     rm -f "$BIN"
-    redis_cli DEL "orderbook:snapshot:BTC/USDT" >/dev/null 2>&1 || true
+    redis_cli DEL \
+        "orderbook:snapshot:BTC/USDT" "orderbook:wal:BTC/USDT" \
+        "orderbook:snapshot:ETH/USDT" "orderbook:wal:ETH/USDT" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -77,5 +79,18 @@ if [ "$INVALID_BEFORE" != "$INVALID_AFTER" ]; then
 fi
 
 run_expect_exit "redis unavailable" 18082 "127.0.0.1:1"
+
+# 多 symbol 边界：BTC 正常（无 Snapshot/WAL，可从 MySQL 重建），ETH WAL 损坏。
+# 任意 symbol 失败时整个 API 必须退出，不能部分恢复后继续服务。
+redis_cli DEL \
+    "orderbook:snapshot:BTC/USDT" "orderbook:wal:BTC/USDT" \
+    "orderbook:snapshot:ETH/USDT" "orderbook:wal:ETH/USDT" >/dev/null
+redis_cli RPUSH "orderbook:wal:ETH/USDT" '{invalid-json' >/dev/null
+run_expect_exit "multi-symbol recovery failure" 18083 "$REDIS_ADDR"
+if ! grep -q "symbol=ETH/USDT" "$LOG"; then
+    echo "FAIL: multi-symbol failure did not report ETH/USDT"
+    cat "$LOG"
+    exit 1
+fi
 
 echo "PASS: API refuses to start when snapshot/WAL recovery is unavailable"
