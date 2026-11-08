@@ -376,6 +376,8 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 				}
 			}()
 
+			releaseCandidates := map[string]struct{}{}
+
 			for _, trade := range trades {
 				if err := s.repo.SaveTradeTx(tx, trade.TradeID, trade.BuyOrder, trade.SellOrder, trade.Price, trade.Quantity, trade.Timestamp); err != nil {
 					tx.Rollback()
@@ -404,34 +406,47 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 
 				// 买家订单状态
 				var buyerOrder persistence.OrderModel
-				if err := tx.Where("order_id = ?", trade.BuyOrder).First(&buyerOrder).Error; err == nil {
-					newRemaining := buyerOrder.Remaining - trade.Quantity
-					buyerStatus := persistence.OrderStatusNew
-					if newRemaining == 0 {
-						buyerStatus = persistence.OrderStatusFilled
-					} else if newRemaining < buyerOrder.Amount {
-						buyerStatus = persistence.OrderStatusPartiallyFilled
-					}
-					if err := s.repo.UpdateOrderTx(tx, trade.BuyOrder, newRemaining, buyerStatus); err != nil {
-						tx.Rollback()
-						return err
-					}
+				if err := tx.Where("order_id = ?", trade.BuyOrder).First(&buyerOrder).Error; err != nil {
+					tx.Rollback()
+					return fmt.Errorf("读取买方订单失败: %w", err)
+				}
+				oldStatus := buyerOrder.Status
+				newRemaining := buyerOrder.Remaining - trade.Quantity
+				buyerStatus := persistence.OrderStatusNew
+				if newRemaining == 0 {
+					buyerStatus = persistence.OrderStatusFilled
+				} else if newRemaining < buyerOrder.Amount {
+					buyerStatus = persistence.OrderStatusPartiallyFilled
+				}
+				if err := s.repo.UpdateOrderTx(tx, trade.BuyOrder, newRemaining, buyerStatus); err != nil {
+					tx.Rollback()
+					return err
+				}
+				if (oldStatus == persistence.OrderStatusNew || oldStatus == persistence.OrderStatusPartiallyFilled) &&
+					newRemaining == 0 &&
+					buyerStatus == persistence.OrderStatusFilled &&
+					buyerOrder.Side == "BUY" &&
+					buyerOrder.OrderType == "LIMIT" &&
+					buyerOrder.TimeInForce == "GTC" {
+					releaseCandidates[trade.BuyOrder] = struct{}{}
 				}
 
 				// 卖家订单状态
 				var sellerOrder persistence.OrderModel
-				if err := tx.Where("order_id = ?", trade.SellOrder).First(&sellerOrder).Error; err == nil {
-					newRemaining := sellerOrder.Remaining - trade.Quantity
-					sellerStatus := persistence.OrderStatusNew
-					if newRemaining == 0 {
-						sellerStatus = persistence.OrderStatusFilled
-					} else if newRemaining < sellerOrder.Amount {
-						sellerStatus = persistence.OrderStatusPartiallyFilled
-					}
-					if err := s.repo.UpdateOrderTx(tx, trade.SellOrder, newRemaining, sellerStatus); err != nil {
-						tx.Rollback()
-						return err
-					}
+				if err := tx.Where("order_id = ?", trade.SellOrder).First(&sellerOrder).Error; err != nil {
+					tx.Rollback()
+					return fmt.Errorf("读取卖方订单失败: %w", err)
+				}
+				sellerNewRemaining := sellerOrder.Remaining - trade.Quantity
+				sellerStatus := persistence.OrderStatusNew
+				if sellerNewRemaining == 0 {
+					sellerStatus = persistence.OrderStatusFilled
+				} else if sellerNewRemaining < sellerOrder.Amount {
+					sellerStatus = persistence.OrderStatusPartiallyFilled
+				}
+				if err := s.repo.UpdateOrderTx(tx, trade.SellOrder, sellerNewRemaining, sellerStatus); err != nil {
+					tx.Rollback()
+					return err
 				}
 
 				_ = s.ledger.RecordTx(tx, trade.BuyUserID, quoteAsset, -tradeAmount, 0, 0, "TRADE", trade.BuyOrder, trade.TradeID,
@@ -477,6 +492,16 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 				return err
 			}
 
+			// 当前 Taker BUY 完全成交也必须进入候选集合；maker 候选已由成交循环收集。
+			// 使用 map 去重，避免 Taker 同时走 Taker/Maker 两条路径。
+			if side == engine.Buy &&
+				orderType == engine.TypeLimit &&
+				tif == engine.TIFGTC &&
+				order.Remaining == 0 &&
+				status == persistence.OrderStatusFilled {
+				releaseCandidates[order.ID] = struct{}{}
+			}
+
 			// 解冻未成交部分（事务内）
 			if order.Remaining > 0 {
 				shouldUnfreeze := false
@@ -503,6 +528,15 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 						tx.Rollback()
 						return err
 					}
+				}
+			}
+
+			// 全部成交处理完成后，统一处理 BUY LIMIT GTC 完全成交价差。
+			// 此时本事务内的全部 Trade、买卖双方状态和当前订单最终状态均已写入。
+			for orderID := range releaseCandidates {
+				if err := s.releaseBuyPriceImprovementTx(tx, orderID, quoteAsset); err != nil {
+					tx.Rollback()
+					return err
 				}
 			}
 
@@ -832,6 +866,67 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		"status":   persistence.OrderStatusCanceled,
 		"user_id":  order.UserID,
 	})
+	return nil
+}
+
+// releaseBuyPriceImprovementTx 在成交结算事务内释放 BUY LIMIT GTC 完全成交价差。
+// claim、解冻、余额快照和 Ledger 必须全部位于同一个 MySQL 事务。
+func (s *OrderService) releaseBuyPriceImprovementTx(tx *gorm.DB, orderID, quoteAsset string) error {
+	claimed, err := s.repo.ClaimPriceImprovementReleaseTx(tx, orderID)
+	if err != nil {
+		return fmt.Errorf("claim 价差释放标记失败: %w", err)
+	}
+	if !claimed {
+		return nil
+	}
+
+	var order persistence.OrderModel
+	if err := tx.Where("order_id = ?", orderID).First(&order).Error; err != nil {
+		return fmt.Errorf("读取价差释放订单失败: %w", err)
+	}
+
+	trades, err := s.repo.GetTradesByOrderTx(tx, orderID)
+	if err != nil {
+		return fmt.Errorf("查询价差释放成交失败: %w", err)
+	}
+	totalSpent := 0.0
+	seenTrades := make(map[string]struct{}, len(trades))
+	for _, trade := range trades {
+		if trade.BuyOrderID != orderID {
+			continue
+		}
+		if trade.TradeID == "" {
+			return fmt.Errorf("成交缺少 TradeID: order_id=%s", orderID)
+		}
+		if _, seen := seenTrades[trade.TradeID]; seen {
+			return fmt.Errorf("重复 TradeID: %s order_id=%s", trade.TradeID, orderID)
+		}
+		seenTrades[trade.TradeID] = struct{}{}
+		totalSpent += float64(trade.Price * trade.Quantity)
+	}
+
+	originalFrozen := float64(order.Price * order.Amount)
+	improvement := originalFrozen - totalSpent
+	if improvement < 0 {
+		return fmt.Errorf("订单 %s 价差为负: frozen=%v spent=%v", orderID, originalFrozen, totalSpent)
+	}
+	if improvement == 0 {
+		return nil
+	}
+
+	if err := s.balanceRepo.UnfreezeBalanceTx(tx, order.UserID, quoteAsset, improvement); err != nil {
+		return fmt.Errorf("价差解冻失败: %w", err)
+	}
+	bal, err := s.balanceRepo.GetBalanceTx(tx, order.UserID, quoteAsset)
+	if err != nil {
+		return fmt.Errorf("读取价差释放后余额失败: %w", err)
+	}
+	if err := s.ledger.RecordTx(
+		tx, order.UserID, quoteAsset, improvement, bal.Available, bal.Frozen,
+		"PRICE_IMPROVEMENT", orderID, "", "BUY LIMIT GTC 完全成交价差释放",
+	); err != nil {
+		return fmt.Errorf("写入价差释放 Ledger 失败: %w", err)
+	}
 	return nil
 }
 

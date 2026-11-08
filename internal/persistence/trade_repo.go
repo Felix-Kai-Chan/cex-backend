@@ -21,8 +21,11 @@ type OrderModel struct {
 	Amount      int64
 	Remaining   int64
 	Status      string `gorm:"size:20"`
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// PriceImprovementReleased 标记 BUY LIMIT GTC 完全成交后的价差是否已处理。
+	// false 表示尚未处理（包括历史 FILLED 订单），true 表示已完成，包括价差为 0 的情况。
+	PriceImprovementReleased bool `gorm:"not null;default:false"`
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 func (OrderModel) TableName() string {
@@ -105,6 +108,21 @@ func (r *TradeRepo) UpdateOrderTx(tx *gorm.DB, orderID string, remaining int64, 
 			"status":     status,
 			"updated_at": time.Now(),
 		}).Error
+}
+
+// ClaimPriceImprovementReleaseTx 条件 claim 价差释放权。
+// 只有 price_improvement_released = false 的订单才能变为 true。
+func (r *TradeRepo) ClaimPriceImprovementReleaseTx(tx *gorm.DB, orderID string) (bool, error) {
+	result := tx.Model(&OrderModel{}).
+		Where("order_id = ? AND price_improvement_released = ?", orderID, false).
+		Updates(map[string]interface{}{
+			"price_improvement_released": true,
+			"updated_at":                 time.Now(),
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
 }
 
 // SaveTrade 保存成交记录

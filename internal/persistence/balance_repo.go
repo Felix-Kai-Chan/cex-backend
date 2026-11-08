@@ -48,6 +48,20 @@ func (r *BalanceRepo) GetBalance(userID, asset string) (*BalanceModel, error) {
 	return &bal, err
 }
 
+// GetBalanceTx 在指定事务内查询用户某个资产的余额。
+// 必须使用传入的 tx，才能读取当前事务内刚完成的解冻结果。
+func (r *BalanceRepo) GetBalanceTx(tx *gorm.DB, userID, asset string) (*BalanceModel, error) {
+	var bal BalanceModel
+	err := tx.Where("user_id = ? AND asset = ?", userID, asset).First(&bal).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, fmt.Errorf("余额记录不存在: user_id=%s asset=%s", userID, asset)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &bal, nil
+}
+
 // ========== 入账 ==========
 
 // AddBalance 入账（充值/成交后）
