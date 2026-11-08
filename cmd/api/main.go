@@ -51,17 +51,31 @@ func main() {
 
 	// 4. 为每个交易对初始化 Snapshotter + 恢复 + 注册
 	symbols := []string{"BTC/USDT", "ETH/USDT"}
+	type loadedSnapshotter struct {
+		symbol      string
+		snapshotter *engine.Snapshotter
+	}
+	loaded := make([]loadedSnapshotter, 0, len(symbols))
+
 	for _, symbol := range symbols {
 		ob := eng.GetOrderBook(symbol)
 		snapshotter := engine.NewSnapshotter(rdb, ob, db, symbol)
 
 		if err := snapshotter.Load(); err != nil {
-			slog.Warn("订单簿恢复失败", "symbol", symbol, "error", err)
+			slog.Error("订单簿恢复失败，拒绝启动", "symbol", symbol, "error", err)
+			os.Exit(1)
 		}
 
-		eng.RegisterSnapshotter(symbol, snapshotter)
+		loaded = append(loaded, loadedSnapshotter{
+			symbol:      symbol,
+			snapshotter: snapshotter,
+		})
+	}
 
-		snapshotter.StartAutoSave()
+	// 只有全部交易对恢复成功，才注册并启动自动快照，避免空订单簿覆盖正常数据。
+	for _, item := range loaded {
+		eng.RegisterSnapshotter(item.symbol, item.snapshotter)
+		item.snapshotter.StartAutoSave()
 	}
 
 	// 5. WebSocket Hub

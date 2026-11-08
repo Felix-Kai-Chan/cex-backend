@@ -128,4 +128,8 @@ echo -e "\n${GREEN}========================================${NC}"
 echo -e "${GREEN}   测试完成：$PASS PASS / $FAIL FAIL${NC}"
 echo -e "${GREEN}========================================${NC}"
 
-kill -9 $NEW_PID 2>/dev/null
+kill -9 $NEW_PID 2>/dev/null || true
+
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi

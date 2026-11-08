@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 echo "=========================================="
 echo "   CEX 全部测试"
@@ -21,21 +21,31 @@ else
     redis-cli FLUSHALL > /dev/null
 fi
 
-# 1. E2E
-echo -e "\n[1/4] E2E 功能测试..."
+# 1. Go 引擎与恢复测试（包含 snapshot_restore_test.go / snapshot_mysql_test.go）
+echo -e "\n[1/7] Go 引擎与恢复测试..."
+go test ./internal/engine -count=1
+
+# 2. E2E
+echo -e "\n[2/7] E2E 功能测试..."
 ./test/e2e_test.sh
 
-# 2. 并发扣减
-echo -e "\n[2/4] 并发扣减测试..."
+# 3. 并发扣减
+echo -e "\n[3/7] 并发扣减测试..."
 go test -v -count=1 ./test -run TestConcurrentDeduct 2>&1 | grep -v "\[mysql\]"
 
-# 3. 撮合压测
-echo -e "\n[3/4] 撮合引擎压测..."
+# 4. 撮合压测
+echo -e "\n[4/7] 撮合引擎压测..."
 go test -v -count=1 ./test -run TestMatchEnginePerformance
 
-# 4. 崩溃恢复
-echo -e "\n[4/4] 崩溃恢复测试..."
+# 5. 崩溃恢复
+echo -e "\n[5/7] 崩溃恢复测试..."
 ./test/stress_recovery.sh
+
+echo -e "\n[6/7] MySQL 按交易对重建恢复测试..."
+./test/test_recovery_rebuild.sh
+
+echo -e "\n[7/7] 恢复失败拒绝启动测试..."
+./test/test_recovery_fail_fast.sh
 
 echo -e "\n=========================================="
 echo "   ✅ 全部测试通过"

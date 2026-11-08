@@ -104,6 +104,20 @@ type OrderBook struct {
 	askPrices *SkipList
 	orders    map[string]*Order
 	mu        sync.RWMutex
+	// tradeMu 串行化当前 symbol 从撮合到 WAL 持久化的完整交易操作。
+	// 与 mu 分开：mu 只保护订单簿数据结构，tradeMu 保护状态变更与 WAL 顺序。
+	tradeMu sync.Mutex
+}
+
+// LockTrading 获取当前 symbol 的交易操作锁。
+// 调用方必须在同一临界区内完成 Match、DB 结算和 WAL 追加。
+func (ob *OrderBook) LockTrading() {
+	ob.tradeMu.Lock()
+}
+
+// UnlockTrading 释放当前 symbol 的交易操作锁。
+func (ob *OrderBook) UnlockTrading() {
+	ob.tradeMu.Unlock()
 }
 
 // NewOrderBook 创建订单簿
@@ -252,7 +266,7 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 			matchOrder.Next = nil
 			delete(ob.orders, matchOrder.ID)
 			changes = append(changes, OrderChange{
-				Op:        "REMOVE",
+				Op:        WALOpRemove,
 				OrderID:   matchOrder.ID,
 				UserID:    matchOrder.UserID,
 				Side:      string(matchOrder.Side),
@@ -322,7 +336,7 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 			delete(rollback.PartialMakers, matchOrder.ID)
 
 			changes = append(changes, OrderChange{
-				Op:        "REMOVE",
+				Op:        WALOpRemove,
 				OrderID:   matchOrder.ID,
 				UserID:    matchOrder.UserID,
 				Side:      string(matchOrder.Side),
@@ -334,6 +348,22 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 			if _, ok := rollback.PartialMakers[matchOrder.ID]; !ok {
 				rollback.PartialMakers[matchOrder.ID] = prevMakerRemaining
 			}
+
+			// Maker 部分成交：Remaining 已减少但订单仍在订单簿中。
+			// 必须记录更新后的 Remaining 绝对值，否则崩溃后只能恢复到成交前的数量。
+			changes = append(changes, OrderChange{
+				Op:        WALOpUpdateRemaining,
+				OrderID:   matchOrder.ID,
+				UserID:    matchOrder.UserID,
+				Side:      string(matchOrder.Side),
+				Type:      matchOrder.Type,
+				TIF:       matchOrder.TIF,
+				ExpireAt:  matchOrder.ExpireAt,
+				Price:     matchOrder.Price,
+				Amount:    matchOrder.Amount,
+				Remaining: matchOrder.Remaining,
+				Timestamp: time.Now().UnixMilli(),
+			})
 		}
 	}
 
@@ -345,7 +375,7 @@ func (ob *OrderBook) Match(order *Order) ([]Trade, []OrderChange, RollbackData) 
 		if canRest {
 			ob.addOrderLocked(order)
 			changes = append(changes, OrderChange{
-				Op:        "ADD",
+				Op:        WALOpAdd,
 				OrderID:   order.ID,
 				UserID:    order.UserID,
 				Side:      string(order.Side),

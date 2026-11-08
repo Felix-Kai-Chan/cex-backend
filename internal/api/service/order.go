@@ -258,6 +258,20 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		Timestamp: time.Now().UnixMilli(),
 	}
 
+	// 7. 获取 symbol 级交易锁，保证撮合顺序、DB 结算顺序与 WAL 序列号顺序一致。
+	// 该锁只按 symbol 独立，不会串行化不同交易对。
+	ob := s.eng.GetOrderBook(req.Symbol)
+	snapshotter := s.eng.GetSnapshotter(req.Symbol)
+	if snapshotter == nil {
+		return nil, fmt.Errorf("交易对 %s 的 WAL 未初始化，拒绝下单", req.Symbol)
+	}
+	ob.LockTrading()
+	defer ob.UnlockTrading()
+
+	if err := snapshotter.WALError(); err != nil {
+		return nil, fmt.Errorf("交易对 %s 已暂停交易: %w", req.Symbol, err)
+	}
+
 	// 7. 冻结
 	var freezeAmount float64
 	var freezeAsset string
@@ -300,7 +314,6 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 	}
 
 	// 8. 撮合
-	ob := s.eng.GetOrderBook(req.Symbol)
 	matchStart := time.Now()
 	trades, changes, rollback := ob.Match(order)
 	matchDuration := time.Since(matchStart)
@@ -512,25 +525,11 @@ func (s *OrderService) CreateOrder(req *CreateOrderRequest) (*CreateOrderRespons
 		return nil, fmt.Errorf("订单结算失败: %w", settleErr)
 	}
 
-	// 12. DB 提交成功后追加 WAL
-	if snapshotter := s.eng.GetSnapshotter(req.Symbol); snapshotter != nil {
-		var walEntries []engine.WALEntry
-		for _, ch := range changes {
-			walEntries = append(walEntries, engine.WALEntry{
-				Op:        ch.Op,
-				OrderID:   ch.OrderID,
-				UserID:    ch.UserID,
-				Side:      ch.Side,
-				Price:     ch.Price,
-				Remaining: ch.Remaining,
-				Timestamp: ch.Timestamp,
-				Type:      ch.Type,
-				Amount:    ch.Amount,
-			})
-		}
-		if err := snapshotter.AppendWALBatch(walEntries); err != nil {
-			slog.Warn("写 WAL 失败", "order_id", order.ID, "error", err)
-		}
+	// 12. DB 提交成功后追加 WAL。WAL 失败时订单簿和 DB 已经发生状态变化，
+	// 不能假装成功；标记该 symbol 的 WAL 失败并拒绝后续交易。
+	walEntries := engine.WALEntriesFromChanges(req.Symbol, changes)
+	if err := snapshotter.AppendWALBatch(walEntries); err != nil {
+		return nil, fmt.Errorf("WAL 持久化失败，交易对 %s 已暂停: %w", req.Symbol, err)
 	}
 
 	if len(tradeResponses) > 0 {
@@ -649,23 +648,33 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 	}
 
 	ob := s.eng.GetOrderBook(symbol)
+	snapshotter := s.eng.GetSnapshotter(symbol)
+	if snapshotter == nil {
+		return fmt.Errorf("交易对 %s 的 WAL 未初始化，拒绝撤单", symbol)
+	}
+	ob.LockTrading()
+	defer ob.UnlockTrading()
+
+	if err := snapshotter.WALError(); err != nil {
+		return fmt.Errorf("交易对 %s 已暂停交易: %w", symbol, err)
+	}
+
 	_, _ = ob.CancelOrder(orderID)
 
 	if err := s.repo.CancelOrder(orderID); err != nil {
 		return err
 	}
 
-	if snapshotter := s.eng.GetSnapshotter(symbol); snapshotter != nil {
-		_ = snapshotter.AppendWAL(engine.WALEntry{
-			Op:        "REMOVE",
-			OrderID:   orderID,
-			UserID:    userID,
-			Side:      order.Side,
-			Price:     order.Price,
-			Remaining: 0,
-			Timestamp: time.Now().UnixMilli(),
-		})
-	}
+	walErr := snapshotter.AppendWAL(engine.WALEntry{
+		Op:        engine.WALOpRemove,
+		Symbol:    symbol,
+		OrderID:   orderID,
+		UserID:    userID,
+		Side:      order.Side,
+		Price:     order.Price,
+		Remaining: 0,
+		Timestamp: time.Now().UnixMilli(),
+	})
 
 	go s.writeCancelOutbox(orderID, userID, symbol, order.Side, order.Price, order.Remaining, order.TimeInForce, order.ExpireAt)
 
@@ -723,6 +732,9 @@ func (s *OrderService) CancelOrder(orderID, userID string) error {
 		"user_id":  userID,
 	})
 
+	if walErr != nil {
+		return fmt.Errorf("撤单已生效，但 WAL 持久化失败，交易对 %s 已暂停: %w", symbol, walErr)
+	}
 	return nil
 }
 

@@ -683,11 +683,38 @@
       tradeRows: document.getElementById('trade-rows'),
     };
 
-    function fmtTime(value) {
-      if (!value) return '-';
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return '-';
-      return date.toLocaleString();
+    function toNumber(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    // 统一格式化为 YYYY-MM-DD HH:mm:ss
+    function formatDateTime(value) {
+      if (value === null || value === undefined || value === '') return '-';
+
+      let date;
+      if (typeof value === 'number') {
+        // 兼容秒级和毫秒级时间戳
+        date = new Date(value < 1e12 ? value * 1000 : value);
+      } else {
+        date = new Date(value);
+      }
+
+      if (Number.isNaN(date.getTime())) {
+        console.warn('[history] invalid datetime:', value);
+        return '-';
+      }
+
+      const pad = (n) => String(n).padStart(2, '0');
+      return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate()),
+      ].join('-') + ' ' + [
+        pad(date.getHours()),
+        pad(date.getMinutes()),
+        pad(date.getSeconds()),
+      ].join(':');
     }
 
     function statusClass(status) {
@@ -698,6 +725,7 @@
         case 'FILLED':
           return 'status-filled';
         case 'CANCELED':
+        case 'CANCELLED':
           return 'status-canceled';
         case 'EXPIRED':
           return 'status-expired';
@@ -706,50 +734,94 @@
       }
     }
 
-    function renderOrderRows(tbody, rows) {
-      if (!rows || rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="history-empty">暂无记录</td></tr>';
+    function emptyRow(tbody, colspan) {
+      if (!tbody) return;
+      tbody.innerHTML = `<tr><td colspan="${colspan}" class="history-empty">暂无记录</td></tr>`;
+    }
+
+    function errorRow(tbody, colspan, message) {
+      if (!tbody) return;
+      tbody.innerHTML = `<tr><td colspan="${colspan}" class="history-empty">加载失败：${message}</td></tr>`;
+    }
+
+    function renderOrderRows(tbody, rows, label = 'orders') {
+      if (!tbody) {
+        console.error(`[history] missing tbody for ${label}`);
         return;
       }
 
-      tbody.innerHTML = rows.map((o) => {
-        const sideClass = o.side === 'BUY' ? 'buy' : 'sell';
-        const sideText = o.side === 'BUY' ? '买入' : '卖出';
-        return `
-          <tr>
-            <td>${fmtTime(o.created_at)}</td>
-            <td>${o.symbol || '-'}</td>
-            <td><span class="badge ${sideClass}">${sideText}</span></td>
-            <td>${o.order_type || '-'}</td>
-            <td class="${sideClass === 'buy' ? 'bid' : 'ask'}">${fmt(o.price)}</td>
-            <td>${fmt(o.amount)}</td>
-            <td>${fmt(o.remaining)}</td>
-            <td><span class="badge ${statusClass(o.status)}">${o.status}</span></td>
-          </tr>
-        `;
-      }).join('');
+      try {
+        const list = Array.isArray(rows) ? rows : [];
+        console.log(`[history] render ${label}:`, list);
+
+        if (list.length === 0) {
+          emptyRow(tbody, 8);
+          return;
+        }
+
+        tbody.innerHTML = list.map((order) => {
+          // 后端字段：order_id / side / order_type / price / amount / remaining / status / created_at
+          const side = String(order?.side || '').toUpperCase();
+          const sideClass = side === 'BUY' ? 'buy' : 'sell';
+          const sideText = side === 'BUY' ? '买入' : '卖出';
+          const status = String(order?.status || '-');
+
+          return `
+            <tr>
+              <td>${formatDateTime(order?.created_at)}</td>
+              <td>${order?.symbol || '-'}</td>
+              <td><span class="badge ${sideClass}">${sideText}</span></td>
+              <td>${order?.order_type || '-'}</td>
+              <td class="${sideClass === 'buy' ? 'bid' : 'ask'}">${fmt(toNumber(order?.price))}</td>
+              <td>${fmt(toNumber(order?.amount))}</td>
+              <td>${fmt(toNumber(order?.remaining))}</td>
+              <td><span class="badge ${statusClass(status)}">${status}</span></td>
+            </tr>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error(`[history] render ${label} failed:`, err);
+        errorRow(tbody, 8, err.message || '未知错误');
+      }
     }
 
     function renderTradeRows(rows) {
-      if (!rows || rows.length === 0) {
-        historyEl.tradeRows.innerHTML = '<tr><td colspan="6" class="history-empty">暂无记录</td></tr>';
+      if (!historyEl.tradeRows) {
+        console.error('[history] missing tbody for trades');
         return;
       }
 
-      historyEl.tradeRows.innerHTML = rows.map((t) => {
-        const sideClass = t.side === 'BUY' ? 'buy' : 'sell';
-        const sideText = t.side === 'BUY' ? '买入' : '卖出';
-        return `
-          <tr>
-            <td>${fmtTime(t.timestamp)}</td>
-            <td>${t.symbol || '-'}</td>
-            <td><span class="badge ${sideClass}">${sideText}</span></td>
-            <td class="${sideClass === 'buy' ? 'bid' : 'ask'}">${fmt(t.price)}</td>
-            <td>${fmt(t.quantity)}</td>
-            <td title="${t.order_id || ''}">${(t.order_id || '-').slice(0, 16)}</td>
-          </tr>
-        `;
-      }).join('');
+      try {
+        const list = Array.isArray(rows) ? rows : [];
+        console.log('[history] render trades:', list);
+
+        if (list.length === 0) {
+          emptyRow(historyEl.tradeRows, 6);
+          return;
+        }
+
+        historyEl.tradeRows.innerHTML = list.map((trade) => {
+          // 后端字段：trade_id / order_id / side / price / quantity / timestamp
+          const side = String(trade?.side || '').toUpperCase();
+          const sideClass = side === 'BUY' ? 'buy' : 'sell';
+          const sideText = side === 'BUY' ? '买入' : '卖出';
+          const orderID = String(trade?.order_id || '-');
+
+          return `
+            <tr>
+              <td>${formatDateTime(trade?.timestamp)}</td>
+              <td>${trade?.symbol || '-'}</td>
+              <td><span class="badge ${sideClass}">${sideText}</span></td>
+              <td class="${sideClass === 'buy' ? 'bid' : 'ask'}">${fmt(toNumber(trade?.price))}</td>
+              <td>${fmt(toNumber(trade?.quantity))}</td>
+              <td title="${orderID}">${orderID.slice(0, 18)}</td>
+            </tr>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error('[history] render trades failed:', err);
+        errorRow(historyEl.tradeRows, 6, err.message || '未知错误');
+      }
     }
 
     async function fetchHistory() {
@@ -757,20 +829,52 @@
       if (!user) return;
 
       const query = `user_id=${encodeURIComponent(user)}&limit=50`;
-      try {
-        const [openData, historyData, tradeData] = await Promise.all([
-          api(`/api/v1/orders?${query}&status=NEW,PARTIALLY_FILLED`),
-          api(`/api/v1/orders?${query}&status=FILLED,CANCELED,EXPIRED`),
-          api(`/api/v1/trades?${query}`),
-        ]);
+      console.log('[history] fetching for user:', user);
 
-        renderOrderRows(historyEl.openOrders, openData.orders);
-        renderOrderRows(historyEl.historyOrders, historyData.orders);
-        renderTradeRows(tradeData.trades);
-        historyEl.updated.textContent = `每 2 秒自动刷新 · 最近更新 ${new Date().toLocaleTimeString()}`;
-      } catch (err) {
-        historyEl.updated.textContent = `历史数据读取失败：${err.message}`;
-      }
+      // 使用 allSettled，避免某一个接口失败导致三个面板全部空白
+      const [openResult, historyResult, tradeResult] = await Promise.allSettled([
+        api(`/api/v1/orders?${query}&status=NEW,PARTIALLY_FILLED`),
+        api(`/api/v1/orders?${query}&status=FILLED,PARTIALLY_FILLED,CANCELED,EXPIRED`),
+        api(`/api/v1/trades?${query}`),
+      ]);
+
+      const readOrders = (result, label) => {
+        if (result.status === 'fulfilled') {
+          const data = result.value;
+          console.log(`[history] ${label} response:`, data);
+          if (!data || !Array.isArray(data.orders)) {
+            console.warn(`[history] ${label} 缺少 orders 数组:`, data);
+            return [];
+          }
+          return data.orders;
+        }
+        console.error(`[history] ${label} request failed:`, result.reason);
+        return [];
+      };
+
+      const readTrades = (result) => {
+        if (result.status === 'fulfilled') {
+          const data = result.value;
+          console.log('[history] trades response:', data);
+          if (!data || !Array.isArray(data.trades)) {
+            console.warn('[history] trades 缺少 trades 数组:', data);
+            return [];
+          }
+          return data.trades;
+        }
+        console.error('[history] trades request failed:', result.reason);
+        return [];
+      };
+
+      const openOrders = readOrders(openResult, 'open orders');
+      const historyOrders = readOrders(historyResult, 'history orders');
+      const trades = readTrades(tradeResult);
+
+      renderOrderRows(historyEl.openOrders, openOrders, 'open orders');
+      renderOrderRows(historyEl.historyOrders, historyOrders, 'history orders');
+      renderTradeRows(trades);
+
+      historyEl.updated.textContent = `每 2 秒自动刷新 · 最近更新 ${formatDateTime(Date.now())}`;
     }
 
     document.querySelectorAll('.tab').forEach((btn) => {
